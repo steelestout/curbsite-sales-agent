@@ -152,6 +152,31 @@ CREATE TABLE IF NOT EXISTS pagespeed_cache (
     cached_at     TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS email_accounts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    email        TEXT NOT NULL UNIQUE,
+    smtp_host    TEXT NOT NULL,
+    smtp_port    INTEGER DEFAULT 587,
+    from_name    TEXT,
+    warmup_day   INTEGER DEFAULT 1,
+    active       INTEGER DEFAULT 1,
+    created_at   TEXT DEFAULT (datetime('now')),
+    updated_at   TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS email_queue (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id       INTEGER NOT NULL REFERENCES leads(id),
+    to_email      TEXT NOT NULL,
+    subject       TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    html_body     TEXT DEFAULT '',
+    status        TEXT DEFAULT 'pending',  -- 'pending' | 'sent' | 'failed'
+    queued_at     TEXT DEFAULT (datetime('now')),
+    scheduled_for TEXT NOT NULL,
+    sent_at       TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_leads_status      ON leads(status);
 CREATE INDEX IF NOT EXISTS idx_leads_score       ON leads(score DESC);
 CREATE INDEX IF NOT EXISTS idx_leads_email       ON leads(email);
@@ -183,6 +208,19 @@ def get_conn(db_path: Path = DB_PATH):
 
 # New columns added to the leads table after initial schema was created.
 # SQLite doesn't support IF NOT EXISTS on ALTER TABLE — we catch the OperationalError.
+_OUTREACH_MIGRATIONS: list[tuple[str, str]] = [
+    ("sender_email", "TEXT"),   # which account sent this message
+]
+
+
+def _migrate_outreach_log(conn: sqlite3.Connection) -> None:
+    for col, col_def in _OUTREACH_MIGRATIONS:
+        try:
+            conn.execute(f"ALTER TABLE outreach_log ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+
 _LEAD_MIGRATIONS: list[tuple[str, str]] = [
     ("pagespeed_mobile",     "INTEGER"),
     ("pagespeed_cached_at",  "TEXT"),
@@ -214,6 +252,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA)
         _migrate_leads(conn)
+        _migrate_outreach_log(conn)
     log.info("Database ready: %s", db_path)
 
 
@@ -304,12 +343,13 @@ def log_outreach(
     subject: str = "",
     body: str = "",
     error: str = "",
+    sender_email: str = "",
 ) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            """INSERT INTO outreach_log (lead_id, type, subject, body, error)
-               VALUES (?, ?, ?, ?, ?)""",
-            (lead_id, type_, subject, body, error),
+            """INSERT INTO outreach_log (lead_id, type, subject, body, error, sender_email)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (lead_id, type_, subject, body, error, sender_email or None),
         )
     return cur.lastrowid
 

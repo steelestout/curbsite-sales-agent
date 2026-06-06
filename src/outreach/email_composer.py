@@ -24,6 +24,7 @@ Sequence overview
 
 import json
 import logging
+import re
 from typing import Optional
 
 from src.config import AGENCY_NAME, AGENCY_URL, AGENCY_OWNER, REPLY_TO
@@ -32,6 +33,63 @@ from src.outreach.pricing import recommend_tier, TierRecommendation, PAYMENT_MET
 from src.outreach.calendly import booking_cta, booking_link
 
 log = logging.getLogger(__name__)
+
+# Common spam trigger words — our AI prompt avoids these, but we log warnings
+# if any slip through so we can improve the prompt.
+_SPAM_WORDS = {
+    "free", "guaranteed", "winner", "click here", "act now", "limited time",
+    "special offer", "buy now", "order now", "risk free", "risk-free",
+    "100% free", "cash", "prize", "congratulations", "earn money",
+    "double your", "million dollars", "no cost", "no credit check",
+    "no hidden", "no obligation", "no risk", "obligation free",
+    "once in a lifetime", "only $", "per day", "per week",
+    "satisfaction guaranteed", "this is not spam", "urgent",
+    "you have been selected", "you're a winner",
+}
+
+_MAX_SUBJECT_LEN = 50
+
+
+# ── Content hygiene helpers ───────────────────────────────────────────────────
+
+def _check_spam_words(text: str) -> list[str]:
+    """Return any spam trigger words found in the text (lowercased)."""
+    lower = text.lower()
+    return [w for w in _SPAM_WORDS if w in lower]
+
+
+def _validate_subject(subject: str) -> str:
+    """
+    Enforce subject line hygiene: trim to 50 chars, no ALL CAPS,
+    no excessive punctuation. Logs a warning if violations are found.
+    """
+    # Warn on ALL CAPS words (3+ chars)
+    if re.search(r'\b[A-Z]{3,}\b', subject):
+        log.warning("Subject contains ALL CAPS — may trigger spam filters: %s", subject)
+
+    # Warn on excessive punctuation
+    if re.search(r'[!?]{2,}', subject):
+        log.warning("Subject has excessive punctuation — may trigger spam filters: %s", subject)
+
+    spam_hits = _check_spam_words(subject)
+    if spam_hits:
+        log.warning("Subject contains spam trigger words %s: %s", spam_hits, subject)
+
+    if len(subject) > _MAX_SUBJECT_LEN:
+        log.warning("Subject is %d chars (max %d): %s", len(subject), _MAX_SUBJECT_LEN, subject)
+        subject = subject[:_MAX_SUBJECT_LEN].rstrip()
+
+    return subject
+
+
+def _check_body(body: str) -> None:
+    """Log warnings for spam trigger words found in email body."""
+    hits = _check_spam_words(body)
+    if hits:
+        log.warning(
+            "Email body contains %d spam trigger word(s): %s — review before sending.",
+            len(hits), hits,
+        )
 
 
 # ── Shared system prompt ───────────────────────────────────────────────────────
@@ -54,6 +112,10 @@ def _system_prompt(extra: str = "") -> str:
         "- Sound like a real person, not a marketing email.\n"
         "- NEVER use phrases like 'I hope this email finds you well', "
         "'leverage', 'synergy', 'touch base', or 'circle back'.\n"
+        "- NEVER use spam trigger words: free, guaranteed, winner, click here, act now, "
+        "limited time, special offer, buy now, risk-free, urgent, congratulations.\n"
+        "- Subject line: under 50 characters. No ALL CAPS. No !! or ??.\n"
+        "- Write plain text only — no HTML, no images, no bullet points with dashes.\n"
         f"- Payment methods, if mentioned: {PAYMENT_METHODS}. "
         "NEVER mention Zelle or check.\n"
         f"{extra}\n"
@@ -186,6 +248,10 @@ def compose_outreach_email(lead: dict) -> tuple[str, str]:
     raw = draft_email(_system_prompt(), user_prompt, high_quality=high_quality)
     subject, body = _parse_subject_body(raw, fallback_subject=fallback_subject)
 
+    # Content hygiene checks
+    subject = _validate_subject(subject)
+    _check_body(body)
+
     # Guarantee the Calendly link appears in the body even if AI dropped it
     if cal_link not in body and "calendly.com" not in body.lower():
         body += f"\n\n{cal_cta}"
@@ -244,6 +310,9 @@ def compose_followup_email(lead: dict, step: int) -> tuple[str, str]:
         raw,
         fallback_subject=f"Re: {lead.get('business_name', 'your website')}",
     )
+
+    subject = _validate_subject(subject)
+    _check_body(body)
 
     # Guarantee link is present
     if cal_link not in body and "calendly.com" not in body.lower():

@@ -28,9 +28,11 @@ from flask import Flask, jsonify, redirect, render_template_string, send_from_di
 from src.config import DASHBOARD_URL, DB_PATH, PORTAL_URL
 from src.crm.database import get_conn
 from src.notifications.client_status import approve_build, reject_build
+from src.outreach.unsubscribe import unsub_bp
 
 log = logging.getLogger(__name__)
 app = Flask(__name__)
+app.register_blueprint(unsub_bp)
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _BUILD_DIR = _ROOT / "data" / "builds"
@@ -140,6 +142,68 @@ def _stats() -> dict:
     clients_to_threshold = max(0, target_clients - total_live)
     target_close_rate = 27.5  # midpoint of 25-30%
 
+    # ── Deliverability ────────────────────────────────────────────────────────
+    # Per-account daily sends vs. limit
+    account_sends_raw = _q(
+        """SELECT sender_email, COUNT(*) as sent_today
+           FROM outreach_log
+           WHERE type='email' AND date(sent_at)=date('now')
+           AND (error IS NULL OR error='')
+           AND sender_email IS NOT NULL
+           GROUP BY sender_email"""
+    )
+    account_sends = {r["sender_email"]: r["sent_today"] for r in account_sends_raw}
+
+    # Bounce rate
+    deliverability_totals = _q1(
+        """SELECT COUNT(*) as total_sent,
+                  SUM(CASE WHEN bounced=1 THEN 1 ELSE 0 END) as total_bounced
+           FROM outreach_log WHERE type='email'"""
+    ) or {"total_sent": 0, "total_bounced": 0}
+    total_sent = deliverability_totals["total_sent"] or 0
+    total_bounced = deliverability_totals["total_bounced"] or 0
+    bounce_rate = round(total_bounced / total_sent * 100, 2) if total_sent else 0.0
+
+    # Unsubscribe rate
+    unsub_count = (_q1("SELECT COUNT(*) as n FROM leads WHERE status='unsubscribed'") or {"n": 0})["n"]
+    unsub_rate = round(unsub_count / total_sent * 100, 2) if total_sent else 0.0
+
+    # Bounced leads count
+    bounced_count = (_q1("SELECT COUNT(*) as n FROM leads WHERE status='bounced'") or {"n": 0})["n"]
+
+    # Queued emails
+    queue_pending = (_q1("SELECT COUNT(*) as n FROM email_queue WHERE status='pending'") or {"n": 0})["n"]
+
+    # Warmup status from env
+    import json as _json, os as _os
+    _sender_raw = _os.getenv("SENDER_ACCOUNTS", "")
+    _warmup_accounts = []
+    if _sender_raw:
+        try:
+            _accts = _json.loads(_sender_raw)
+            for _a in _accts:
+                from src.outreach.warmup import warmup_status as _ws, get_warmup_limit as _gwl
+                _status = _ws(_a)
+                _sent = account_sends.get(_a["email"], 0)
+                _status["sent_today"] = _sent
+                _warmup_accounts.append(_status)
+        except Exception:
+            pass
+
+    deliverability = {
+        "account_sends": account_sends,
+        "warmup_accounts": _warmup_accounts,
+        "total_sent": total_sent,
+        "total_bounced": total_bounced,
+        "bounce_rate": bounce_rate,
+        "bounce_flag": bounce_rate > 2.0,
+        "unsub_count": unsub_count,
+        "unsub_rate": unsub_rate,
+        "unsub_flag": unsub_rate > 0.5,
+        "bounced_leads": bounced_count,
+        "queue_pending": queue_pending,
+    }
+
     # ── Pending approvals ─────────────────────────────────────────────────────
     pending_approvals = _q(
         "SELECT l.id, l.business_name, l.niche, l.updated_at "
@@ -178,6 +242,7 @@ def _stats() -> dict:
         "target_close_rate": target_close_rate,
         "pending_approvals": pending_approvals,
         "revision_needed": revision_needed,
+        "deliverability": deliverability,
     }
 
 
@@ -318,6 +383,7 @@ tr:hover td{background:#1f3a1f;}
   <button class="tab-btn" onclick="showTab('rook')">Rook</button>
   <button class="tab-btn" onclick="showTab('portfolio')">Portfolio</button>
   <button class="tab-btn" onclick="showTab('optimizer')">Price Optimizer</button>
+  <button class="tab-btn" onclick="showTab('deliverability')">Deliverability</button>
 </nav>
 
 <main>
@@ -636,6 +702,138 @@ tr:hover td{background:#1f3a1f;}
     </div>
     {% endif %}
   </div>
+</section>
+
+<!-- ── DELIVERABILITY ─────────────────────────────────────────────────── -->
+<section id="tab-deliverability" class="section">
+
+  {% set d = stats.deliverability %}
+
+  <!-- Health flags -->
+  {% if d.bounce_flag %}
+  <div class="alert danger">
+    <strong>⚠ Bounce rate {{ d.bounce_rate }}% — above 2% threshold</strong>
+    High bounce rate signals list quality issues and damages domain reputation.
+    Stop sending to unverified addresses immediately.
+  </div>
+  {% endif %}
+  {% if d.unsub_flag %}
+  <div class="alert warn">
+    <strong>⚠ Unsubscribe rate {{ d.unsub_rate }}% — above 0.5% threshold</strong>
+    Reduce send volume or improve targeting. Excessive unsubs trigger ISP flags.
+  </div>
+  {% endif %}
+  {% if not d.bounce_flag and not d.unsub_flag %}
+  <div class="alert success">
+    <strong>Deliverability health looks good</strong>
+    Bounce {{ d.bounce_rate }}% (threshold 2%) · Unsubscribe {{ d.unsub_rate }}% (threshold 0.5%)
+  </div>
+  {% endif %}
+
+  <!-- KPI cards -->
+  <div class="card-grid">
+    <div class="stat-card">
+      <div class="label">Total Sent</div>
+      <div class="value">{{ d.total_sent }}</div>
+      <div class="sub">all-time emails</div>
+    </div>
+    <div class="stat-card {{ 'red' if d.bounce_flag else 'green' }}">
+      <div class="label">Bounce Rate</div>
+      <div class="value">{{ d.bounce_rate }}%</div>
+      <div class="sub">{{ d.total_bounced }} hard bounced · flag >2%</div>
+    </div>
+    <div class="stat-card {{ 'amber' if d.unsub_flag else 'green' }}">
+      <div class="label">Unsub Rate</div>
+      <div class="value">{{ d.unsub_rate }}%</div>
+      <div class="sub">{{ d.unsub_count }} unsubscribed · flag >0.5%</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Queued</div>
+      <div class="value">{{ d.queue_pending }}</div>
+      <div class="sub">emails pending send</div>
+    </div>
+  </div>
+
+  <!-- Per-account warmup table -->
+  <div class="chart-wrap">
+    <h3>Sending Accounts — Today's Volume vs. Warmup Cap</h3>
+    {% if d.warmup_accounts %}
+    <div class="tbl-wrap" style="margin-top:12px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Account</th>
+            <th>Warmup Day</th>
+            <th>Week</th>
+            <th>Daily Cap</th>
+            <th>Sent Today</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in d.warmup_accounts %}
+          {% set pct = (a.sent_today / [a.daily_limit, 1]|max * 100)|int %}
+          <tr>
+            <td style="font-family:monospace;font-size:12px;">{{ a.email }}</td>
+            <td>{{ a.warmup_day }}</td>
+            <td>Week {{ a.week }}</td>
+            <td>{{ a.daily_limit }}/day</td>
+            <td>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <div style="background:var(--card2);border-radius:3px;height:10px;width:80px;overflow:hidden;">
+                  <div style="width:{{ [pct,100]|min }}%;height:100%;background:{{ 'var(--red)' if pct >= 90 else 'var(--accent)' }};"></div>
+                </div>
+                {{ a.sent_today }}/{{ a.daily_limit }}
+              </div>
+            </td>
+            <td>
+              {% if a.is_warmed %}
+              <span style="color:var(--accent);">Fully warmed</span>
+              {% else %}
+              <span style="color:var(--amber);">Warming — {{ a.days_to_full }} days left</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p style="color:var(--muted);font-size:13px;margin-top:8px;">
+      No SENDER_ACCOUNTS configured. Add them to .env — see <code>docs/EMAIL_SETUP.md</code>.
+    </p>
+    {% endif %}
+  </div>
+
+  <!-- Blocked leads summary -->
+  <div class="card-grid">
+    <div class="stat-card">
+      <div class="label">Bounced Leads</div>
+      <div class="value">{{ d.bounced_leads }}</div>
+      <div class="sub">permanently blocked</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Unsubscribed</div>
+      <div class="value">{{ d.unsub_count }}</div>
+      <div class="sub">opted out</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Domain Rep</div>
+      <div class="value" style="font-size:16px;">SPF/DKIM/DMARC</div>
+      <div class="sub">run: <code style="font-size:11px;">python -m src.outreach.domain_reputation</code></div>
+    </div>
+  </div>
+
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;font-size:13px;color:var(--muted);line-height:1.7;">
+    <strong style="color:var(--text);display:block;margin-bottom:6px;">Deliverability quick-ref</strong>
+    • Bounce rate &gt;2% → stop sending, clean list<br>
+    • Unsubscribe rate &gt;0.5% → reduce volume, improve targeting<br>
+    • New accounts: use warmup schedule (22 days to full volume)<br>
+    • Always send from a subdomain (mail.curbsite.co), never from curbsite.co itself<br>
+    • Run <code>python -m src.outreach.domain_reputation mail.curbsite.co</code> to verify DNS<br>
+    • Full setup guide: <code>docs/EMAIL_SETUP.md</code>
+  </div>
+
 </section>
 
 </main>
