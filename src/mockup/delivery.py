@@ -35,7 +35,7 @@ from src.config import (
 )
 from src.ai_client import chat
 from src.crm.database import update_lead_status, log_outreach, get_conn
-from src.outreach.email_sender import send_email
+from src.outreach.sender import send_email
 
 log = logging.getLogger(__name__)
 

@@ -17,18 +17,15 @@ All HTML emails are single-column, mobile-first, Curbsite-branded.
 
 import logging
 import secrets
-import smtplib
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 from src.config import (
-    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
     FROM_NAME, FROM_EMAIL, REPLY_TO,
     AGENCY_NAME, AGENCY_URL,
     STEELE_EMAIL, DASHBOARD_URL, PORTAL_URL,
 )
 from src.crm.database import get_conn, get_lead, update_lead_status
+from src.notifications.transactional import send_transactional, send_to_steele
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +34,9 @@ _BTN   = "#2e7d32"
 _BTN_RED = "#b71c1c"
 
 
-# ── Low-level email helper ────────────────────────────────────────────────────
+# ── Low-level email helpers ───────────────────────────────────────────────────
+# These thin wrappers preserve the call signature used by reviews/request.py
+# and referrals/drip.py — they now route through Resend (or SMTP fallback).
 
 def _send_html_email(
     to_email: str,
@@ -45,27 +44,20 @@ def _send_html_email(
     html_body: str,
     text_body: str = "",
 ) -> None:
-    """Send an HTML email. Raises on failure (caller handles retry/logging)."""
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = f"{FROM_NAME} <{FROM_EMAIL}>"
-    msg["To"] = to_email
-    msg["Reply-To"] = REPLY_TO
-
-    if text_body:
-        msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-        s.ehlo()
-        s.starttls()
-        s.login(SMTP_USER, SMTP_PASS)
-        s.sendmail(FROM_EMAIL, [to_email], msg.as_string())
+    """Send a transactional HTML email via Resend (SMTP fallback if not configured)."""
+    ok = send_transactional(
+        to_email=to_email,
+        subject=subject,
+        html=html_body,
+        text=text_body,
+    )
+    if not ok:
+        raise RuntimeError(f"Failed to send transactional email to {to_email}")
 
 
 def _send_steele(subject: str, text: str, html: str = "") -> None:
-    """Shortcut for system alerts to Steele."""
-    _send_html_email(STEELE_EMAIL, subject, html or f"<pre>{text}</pre>", text)
+    """Internal alert to Steele — routes through send_to_steele()."""
+    send_to_steele(subject=subject, text=text, html=html)
 
 
 # ── Shared email chrome ────────────────────────────────────────────────────────

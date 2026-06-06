@@ -138,5 +138,20 @@ STEELE_EMAIL: str = os.getenv("STEELE_EMAIL", "steele.stout@gmail.com")
 # ── Voice scoring threshold (flags high-value leads for Rook outreach) ────────
 SCORE_VOICE_THRESHOLD: int = int(os.getenv("SCORE_VOICE_THRESHOLD", "70"))
 
+# ── Resend (transactional email) ──────────────────────────────────────────────
+# Used for: client status emails, approvals, review requests, referrals, go-live
+# Sign up: https://resend.com  |  Free: 3k emails/mo
+RESEND_API_KEY: str = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL: str = os.getenv("RESEND_FROM_EMAIL", f"{FROM_NAME} <{FROM_EMAIL}>")
+
+# ── Instantly.ai (cold outreach) ──────────────────────────────────────────────
+# Used for: initial cold emails and follow-up sequences to prospects
+# Sign up: https://instantly.ai  |  ~$37/mo Hypergrowth
+# INSTANTLY_CAMPAIGN_ID: add lead to a campaign (recommended for sequences)
+# Leave blank to use direct-send mode (one-off API sends)
+INSTANTLY_API_KEY: str = os.getenv("INSTANTLY_API_KEY", "")
+INSTANTLY_CAMPAIGN_ID: str = os.getenv("INSTANTLY_CAMPAIGN_ID", "")
+INSTANTLY_FROM_EMAIL: str = os.getenv("INSTANTLY_FROM_EMAIL", FROM_EMAIL)
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

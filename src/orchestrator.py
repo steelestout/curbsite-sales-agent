@@ -76,7 +76,7 @@ from src.crm.database import init_db, get_leads, get_lead, update_lead_status
 from src.prospecting.scraper import prospect
 from src.prospecting.scorer import score_all_new_leads
 from src.outreach.email_composer import compose_outreach_email
-from src.outreach.email_sender import send_email, reset_daily_counter
+from src.outreach.sender import send_email, reset_daily_counter
 from src.followup.sequence import schedule_followups, process_due_followups
 from src.crm.dossier import generate_all_booked_dossiers
 from src.analytics.reporter import weekly_report

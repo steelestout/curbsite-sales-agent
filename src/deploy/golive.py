@@ -26,7 +26,7 @@ from src.config import (
 )
 from src.ai_client import chat
 from src.crm.database import update_lead_status, log_outreach
-from src.outreach.email_sender import send_email
+from src.notifications.transactional import send_transactional
 from src.outreach.pricing import PRICE_CARE_MIN, PRICE_CARE_MAX
 
 log = logging.getLogger(__name__)
@@ -143,12 +143,18 @@ def notify_client_golive(
 
     subject, body = _compose_golive_email(lead, domain, portal_url)
 
-    success = send_email(
-        lead_id=lead["id"],
+    if dry_run:
+        log.info("[DRY RUN] Would send go-live email to %s: %s", client_email, subject)
+        return True
+
+    # Go-live email is transactional — client has already paid and expects this.
+    success = send_transactional(
         to_email=client_email,
         subject=subject,
-        body=body,
-        dry_run=dry_run,
+        html=f"<div style='font-family:sans-serif;max-width:600px'>{body.replace(chr(10), '<br>')}</div>",
+        text=body,
+        lead_id=lead["id"],
+        log_to_crm=True,
     )
 
     if success:

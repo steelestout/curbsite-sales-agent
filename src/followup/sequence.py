@@ -24,7 +24,7 @@ from src.crm.database import (
     update_lead_status,
 )
 from src.outreach.email_composer import compose_followup_email
-from src.outreach.email_sender import send_email
+from src.outreach.sender import send_email
 
 log = logging.getLogger(__name__)
 

@@ -42,7 +42,7 @@ def _report():
 
 
 def _reset_counter():
-    from src.outreach.email_sender import reset_daily_counter
+    from src.outreach.sender import reset_daily_counter
     reset_daily_counter()
 
 

@@ -27,11 +27,9 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from src.config import (
-    AGENCY_NAME, AGENCY_OWNER, AGENCY_URL,
-    SMTP_USER, SMTP_PASS, SMTP_HOST, SMTP_PORT, FROM_NAME, FROM_EMAIL, REPLY_TO,
-)
+from src.config import AGENCY_NAME, AGENCY_OWNER, AGENCY_URL
 from src.crm.database import update_lead_status
+from src.notifications.transactional import send_transactional
 
 log = logging.getLogger(__name__)
 
@@ -159,10 +157,7 @@ def _send_handoff_email(
     domain: str,
     dry_run: bool = False,
 ) -> bool:
-    """Send the zip delivery email with the site attached."""
-    import smtplib
-    from email.message import EmailMessage
-
+    """Send the zip delivery email with the site attached (via Resend or SMTP fallback)."""
     to_email = lead.get("email")
     if not to_email:
         log.error("No email address for lead #%d — cannot send handoff.", lead["id"])
@@ -203,49 +198,38 @@ Payment methods: Stripe (via our secure portal), Venmo, or CashApp
         return True
 
     zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
-    if zip_size_mb > 20:
+    attachment = None
+
+    if zip_size_mb <= 20:
+        attachment = [{"filename": zip_path.name, "content": zip_path.read_bytes()}]
+    else:
         log.warning(
-            "Zip is %.1f MB — skipping attachment, sending download-link placeholder instead",
+            "Zip is %.1f MB — too large to attach; sending without attachment.",
             zip_size_mb,
         )
         body = body.replace(
             "I've attached everything you need as a zip file.",
-            f"I've prepared your site files. They're too large to attach directly — "
-            f"I'll send you a secure download link separately.",
+            "I've prepared your site files. They're too large to attach directly — "
+            "I'll send you a secure download link separately.",
         )
 
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = f"{FROM_NAME} <{FROM_EMAIL}>"
-        msg["To"] = to_email
-        msg["Cc"] = _SUPPORT_EMAIL
-        msg["Reply-To"] = REPLY_TO
-        msg.set_content(body)
+    html = f"<div style='font-family:sans-serif;max-width:600px'>{body.replace(chr(10), '<br>')}</div>"
 
-        if zip_size_mb <= 20:
-            with open(zip_path, "rb") as f:
-                msg.add_attachment(
-                    f.read(),
-                    maintype="application",
-                    subtype="zip",
-                    filename=zip_path.name,
-                )
+    ok = send_transactional(
+        to_email=to_email,
+        subject=subject,
+        html=html,
+        text=body,
+        lead_id=lead["id"],
+        log_to_crm=True,
+        attachments=attachment,
+    )
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
-            smtp.starttls()
-            smtp.login(SMTP_USER, SMTP_PASS)
-            smtp.send_message(msg)
-
-        log.info(
-            "Handoff email sent to %s (lead #%d, %s)",
-            to_email, lead["id"], business,
-        )
-        return True
-
-    except Exception as exc:
-        log.error("Failed to send handoff email to %s: %s", to_email, exc)
-        return False
+    if ok:
+        log.info("Handoff email sent to %s (lead #%d, %s)", to_email, lead["id"], business)
+    else:
+        log.error("Failed to send handoff email to %s", to_email)
+    return ok
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

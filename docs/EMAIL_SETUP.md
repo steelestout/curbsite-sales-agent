@@ -1,309 +1,247 @@
-# Email Deliverability Setup Guide
+# Email Infrastructure Setup Guide
 
-Complete setup guide for sending cold outreach at scale without landing in spam.
-Follow every step — skipping any one of them meaningfully hurts deliverability.
+Curbsite uses two dedicated services for two distinct email types. Using the
+right tool for each prevents deliverability problems and keeps you compliant
+with each service's Terms of Service.
 
 ---
 
-## The #1 Rule: Never Send Cold Email from Your Main Domain
+## Two-Service Architecture
 
-**curbsite.co** is your brand. One spam complaint from cold outreach can destroy
-your email reputation for the entire domain — affecting your own business emails,
-client communications, and every future send.
+```
+Cold outreach (prospects)  →  Instantly.ai
+Transactional (clients)    →  Resend
+Both missing               →  SMTP fallback (development/testing only)
+```
 
-Instead, send cold outreach from a **subdomain**:
-- `mail.curbsite.co`  (recommended)
+| Email Type | Service | Why |
+|-----------|---------|-----|
+| Initial cold email to prospects | **Instantly.ai** | Purpose-built for cold email; handles warming, rotation, compliance |
+| Follow-up sequences (Day 3, Day 7) | **Instantly.ai** | Multi-step campaign sequences |
+| Build started notification | **Resend** | Client expects this after paying deposit |
+| Site preview ready / approval | **Resend** | Triggered by Steele's approval action |
+| Payment confirmed | **Resend** | Triggered by Stripe webhook |
+| Site live celebration email | **Resend** | Client expects this at launch |
+| Review requests (14-day, 30-day) | **Resend** | Warm relationship email |
+| Referral drip (30-day post-live) | **Resend** | Warm relationship email |
+| Steele internal approval alerts | **Resend** | Internal notification |
+| Track B handoff zip delivery | **Resend** | Client deliverable email |
+
+### Why NOT SendGrid / Mailgun / Amazon SES for cold outreach
+
+All three prohibit unsolicited email in their ToS. Getting flagged:
+- Terminates your entire account (including any transactional sends)
+- Impacts your domain reputation permanently
+- Loses all templates, stats, and history
+
+Use SendGrid/Mailgun only for transactional email if you ever switch from Resend.
+
+---
+
+## Service 1: Resend (Transactional)
+
+**Cost:** Free up to 3,000 emails/month. $20/month for 50,000.  
+**Best for:** Any email a paying client expects to receive.
+
+### Setup
+
+1. Sign up at [resend.com](https://resend.com)
+
+2. Add and verify your sending domain:
+   - Resend dashboard → Domains → Add domain
+   - Add the DNS records Resend gives you (they walk you through it)
+   - Recommended sending address: `steele@curbsite.co` or `steele@mail.curbsite.co`
+
+3. Create an API key:
+   - Resend dashboard → API Keys → Create API Key
+   - Copy and add to `.env`: `RESEND_API_KEY=re_...`
+
+4. Set your From address in `.env`:
+   ```
+   RESEND_FROM_EMAIL=Steele @ Curbsite <steele@curbsite.co>
+   ```
+
+5. Install the Python SDK:
+   ```bash
+   pip install resend
+   ```
+
+### What Resend handles automatically
+- Delivery tracking (opens, clicks if enabled)
+- Bounce handling
+- Unsubscribe compliance for transactional email
+- Domain reputation monitoring
+- Beautiful delivery logs in the dashboard
+
+---
+
+## Service 2: Instantly.ai (Cold Outreach)
+
+**Cost:** ~$37/month (Hypergrowth) — unlimited sending accounts + warming included.  
+**Best for:** Any email to a prospect who hasn't signed up or paid yet.
+
+### Why Instantly over raw SMTP
+- **Auto-warming:** New accounts warm up automatically — no manual warmup_day tracking needed
+- **Account rotation:** Connects multiple inboxes and rotates between them automatically
+- **Reply detection:** Detects when prospects reply and pauses follow-ups
+- **Deliverability dashboard:** Real-time spam score, bounce rate, and health metrics
+- **Unsubscribe built-in:** One-click unsubscribe handled automatically by Instantly
+- **Multi-step sequences:** Build Day 0 → Day 3 → Day 7 sequences in the UI
+
+### Setup
+
+1. Sign up at [instantly.ai](https://instantly.ai) (Hypergrowth plan recommended)
+
+2. Connect your sending inboxes:
+   - Settings → Email Accounts → Connect Account
+   - Connect your Google Workspace accounts (e.g., `outreach@mail.curbsite.co`)
+   - Instantly will automatically warm them up over 4 weeks
+
+3. (Recommended) Create a cold outreach campaign:
+   - Campaigns → New Campaign → "Curbsite Cold Outreach"
+   - Add your email sequence: Day 0 initial, Day 3 follow-up, Day 7 final
+   - Use `{{first_name}}`, `{{business_name}}`, etc. for personalization
+   - Set the campaign to active
+
+4. Get your API key:
+   - Settings → Integrations → API → Generate
+   - Add to `.env`: `INSTANTLY_API_KEY=...`
+
+5. Get your campaign ID:
+   - Open the campaign → Settings → Copy campaign ID from the URL
+   - Add to `.env`: `INSTANTLY_CAMPAIGN_ID=...`
+   - If left blank, emails go via direct-send API instead of a campaign
+
+6. Set your From address:
+   ```
+   INSTANTLY_FROM_EMAIL=outreach@mail.curbsite.co
+   ```
+
+### Two send modes
+
+**Campaign mode** (`INSTANTLY_CAMPAIGN_ID` set — recommended):
+- Our code calls `send_email()` → adds prospect to the Instantly campaign
+- Instantly handles send timing, warming, rotation, and follow-up steps
+- Reply detection automatically removes prospects from the sequence
+- Best for systematic cold outreach sequences
+
+**Direct send mode** (`INSTANTLY_CAMPAIGN_ID` not set):
+- Our code calls Instantly's `/api/v2/emails/send` endpoint
+- Sends immediately through a connected inbox
+- Use for one-off sends outside a regular sequence
+
+---
+
+## SMTP Fallback (No API Keys Set)
+
+When neither `INSTANTLY_API_KEY` nor `RESEND_API_KEY` is set, all email falls
+back to raw SMTP using `SMTP_HOST/USER/PASS` from `.env`. This path still
+enforces warmup limits and deliverability gates but requires manual DNS setup.
+
+**Only use SMTP fallback for:**
+- Local development and testing
+- First week while you're getting Resend/Instantly set up
+
+**SMTP DNS requirements** (if you end up using SMTP for cold outreach):
+
+Never send cold email from your main domain (`curbsite.co`). Use a subdomain:
+- `mail.curbsite.co`
 - `outreach.curbsite.co`
-- `hello.curbsite.co`
 
-Your main domain stays clean. If the sending subdomain ever gets flagged, you
-create a new one while your brand domain remains unaffected.
-
----
-
-## Recommended Sending Infrastructure
-
-### Option A: Google Workspace (Best Deliverability — Recommended)
-
-**Cost:** $6/month per account  
-**Why:** Gmail-to-Gmail delivery is treated with highest trust by Gmail's filters,
-which is where most small business owners have their email.
-
-**Setup:**
-1. Go to [workspace.google.com](https://workspace.google.com) → Get started
-2. Use your sending subdomain as the domain (e.g., `mail.curbsite.co`)
-3. Create a sending account: `outreach@mail.curbsite.co` or `steele@mail.curbsite.co`
-4. Enable 2FA, then generate an **App Password**:
-   - Google Account → Security → 2-Step Verification → App passwords
-   - Select app: "Mail", device: "Other" → name it "Curbsite Outreach"
-   - Copy the 16-char password — this goes in `.env` as `SMTP_PASS`
-5. Add to `.env`: `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`
-6. Set up SPF, DKIM, and DMARC (see DNS Setup below)
-
-**Limits:** 500 emails/day per account (vs. 25 for free Gmail). We cap at 50/day
-for cold outreach to stay well below Gmail's spam-detection thresholds.
-
----
-
-### Option B: Instantly.ai or Smartlead (Fully Managed — Easiest)
-
-**Cost:** $37–97/month  
-**Why:** These platforms handle inbox warming, account rotation, and deliverability
-monitoring automatically. Zero DNS setup friction. Recommended if you want to
-focus on sales rather than infrastructure.
-
-- [Instantly.ai](https://instantly.ai) — best UI, auto-warming, supports Google Workspace + Outlook
-- [Smartlead.ai](https://smartlead.ai) — similar features, slightly cheaper
-
-**Setup:**
-1. Sign up for Instantly.ai
-2. Connect your Google Workspace accounts
-3. Add `INSTANTLY_API_KEY=your_key` to `.env`
-4. Instantly handles warming, rotation, and bounce tracking
-
----
-
-### What NOT to Use for Cold Outreach
-
-| Service | Use it for | Do NOT use for |
-|---------|-----------|----------------|
-| SendGrid | Transactional email (receipts, go-live alerts, client notifications) | Cold outreach — they will ban your account |
-| Mailgun | Transactional email | Cold outreach |
-| Amazon SES | Bulk transactional email | Cold outreach |
-| Free Gmail (@gmail.com) | Personal email | Outreach — 500/day limit AND terrible deliverability for cold email |
-
-SendGrid and Mailgun are excellent services — but their Terms of Service prohibit
-cold email, and their shared IP pools are over-used for spam, hurting deliverability.
-
----
-
-## DNS Setup (Required for Every Sending Domain)
-
-All three records must be configured before sending a single cold email.
-Run `python -m src.outreach.domain_reputation mail.curbsite.co` to verify.
-
-### 1. Sending Subdomain DNS
-
-If sending from `mail.curbsite.co`, add this to your DNS (at Namecheap, Cloudflare, etc.):
-
-```
-Type: A (or CNAME)
-Name: mail
-Value: (your sending server IP or Google's MX)
-```
-
-For Google Workspace sending, you'll set up MX records pointing to Google's servers.
-Google Workspace Admin → Domains → Add domain → `mail.curbsite.co` → follow their DNS wizard.
-
----
-
-### 2. SPF Record
-
-**What it does:** Tells receiving servers which IPs are authorized to send email
-for your domain. Without SPF, your emails are likely to be marked spam.
-
-**For Google Workspace:**
+### SPF record
 ```
 Type: TXT
-Name: mail.curbsite.co  (or @ if your sending domain is the root)
+Name: mail.curbsite.co
 Value: v=spf1 include:_spf.google.com ~all
-TTL: 3600
 ```
 
-**For SendGrid (transactional only):**
-```
-Value: v=spf1 include:sendgrid.net ~all
-```
+### DKIM (Google Workspace)
+1. Google Workspace Admin → Apps → Gmail → Authenticate email
+2. Select domain `mail.curbsite.co`, key length 2048
+3. Generate record → add TXT at `google._domainkey.mail.curbsite.co`
+4. Click "Start authentication"
 
-**Verify:**
-```bash
-nslookup -type=TXT mail.curbsite.co
-# Should show: "v=spf1 include:_spf.google.com ~all"
-```
-
----
-
-### 3. DKIM Record
-
-**What it does:** Cryptographically signs outgoing emails so recipients can verify
-they weren't tampered with in transit. Without DKIM, many filters auto-reject.
-
-**Generate your DKIM key (Google Workspace):**
-1. Google Workspace Admin Console → Apps → Google Workspace → Gmail
-2. Click "Authenticate email"
-3. Select your sending domain: `mail.curbsite.co`
-4. DKIM key bit length: 2048
-5. Click "Generate new record"
-6. Copy the TXT record value — it looks like `v=DKIM1; k=rsa; p=MIIBIjANBg...`
-
-**Add to DNS:**
-```
-Type: TXT
-Name: google._domainkey.mail.curbsite.co
-Value: v=DKIM1; k=rsa; p=<your-key-here>
-TTL: 3600
-```
-
-**Enable DKIM in Workspace:**
-Back in Google Admin → Gmail → Authenticate email → click "Start authentication"
-
-**Verify:**
-```bash
-python -m src.outreach.domain_reputation mail.curbsite.co google
-# Should show: DKIM: OK
-```
-
----
-
-### 4. DMARC Record
-
-**What it does:** Tells receiving servers what to do when an email fails SPF/DKIM
-checks. Protects your domain from spoofing and gives you visibility into abuse.
-
-**Start with monitoring (p=none), then tighten:**
-
-**Step 1 — Monitoring only (first 2 weeks):**
+### DMARC
 ```
 Type: TXT
 Name: _dmarc.mail.curbsite.co
-Value: v=DMARC1; p=none; rua=mailto:steele.stout@gmail.com
-TTL: 3600
-```
-
-**Step 2 — Quarantine (after 2 weeks of clean reports):**
-```
 Value: v=DMARC1; p=quarantine; rua=mailto:steele.stout@gmail.com
 ```
 
-**Step 3 — Reject (once everything is confirmed working):**
-```
-Value: v=DMARC1; p=reject; rua=mailto:steele.stout@gmail.com
-```
-
-`rua=` receives aggregate XML reports daily — useful for spotting misconfigurations.
-
-**Verify:**
+### Verify DNS
 ```bash
-nslookup -type=TXT _dmarc.mail.curbsite.co
-# Should show: "v=DMARC1; p=quarantine; ..."
+python -m src.outreach.domain_reputation mail.curbsite.co
 ```
 
 ---
 
-### 5. MX Records
+## Warmup Schedule (SMTP fallback only)
 
-Required if you want replies to land in your Google Workspace inbox.
+When using Instantly, warmup is handled automatically. When using SMTP directly:
 
-**Google Workspace MX records for `mail.curbsite.co`:**
+| Period | Daily Cap |
+|--------|----------|
+| Days 1–7 | 5/day |
+| Days 8–14 | 15/day |
+| Days 15–21 | 30/day |
+| Day 22+ | 50/day |
+
+Track warmup: `python -m src.outreach.warmup --status`
+
+---
+
+## CAN-SPAM Compliance
+
+Handled automatically for all paths:
+- **Instantly.ai:** manages unsubscribes natively in the platform
+- **Resend + SMTP:** `src/outreach/compliance.py` injects footer and `List-Unsubscribe` header
+- **Dashboard `/unsubscribe` endpoint:** handles one-click unsubscribes from raw SMTP emails
+
+Physical address (required by CAN-SPAM §5):
 ```
-Type: MX  Priority: 1   Value: aspmx.l.google.com
-Type: MX  Priority: 5   Value: alt1.aspmx.l.google.com
-Type: MX  Priority: 5   Value: alt2.aspmx.l.google.com
-Type: MX  Priority: 10  Value: alt3.aspmx.l.google.com
-Type: MX  Priority: 10  Value: alt4.aspmx.l.google.com
-TTL: 3600
+CURBSITE_ADDRESS=Curbsite.co · Kokomo, IN 46902 · United States
 ```
 
 ---
 
-## Inbox Warming Schedule
+## .env Quick-Start Checklist
 
-Never start sending at full volume with a new account. ISPs watch for new accounts
-that immediately send hundreds of emails — it's a strong spam signal.
-
-The warmup schedule enforced by `src/outreach/warmup.py`:
-
-| Period | Daily Limit |
-|--------|------------|
-| Week 1 (days 1–7) | 5 emails/day |
-| Week 2 (days 8–14) | 15 emails/day |
-| Week 3 (days 15–21) | 30 emails/day |
-| Week 4+ (days 22+) | 50 emails/day |
-
-**Configure in `.env`:**
 ```bash
-SENDER_ACCOUNTS=[{"email":"outreach@mail.curbsite.co","smtp_host":"smtp.gmail.com",
-  "smtp_port":587,"smtp_pass":"your-app-password","from_name":"Steele @ Curbsite",
-  "warmup_day":1}]
+# Resend (transactional)
+RESEND_API_KEY=re_...
+RESEND_FROM_EMAIL=Steele @ Curbsite <steele@curbsite.co>
+
+# Instantly (cold outreach)
+INSTANTLY_API_KEY=...
+INSTANTLY_CAMPAIGN_ID=...          # recommended
+INSTANTLY_FROM_EMAIL=outreach@mail.curbsite.co
+
+# CAN-SPAM compliance
+CURBSITE_ADDRESS=Curbsite.co · Kokomo, IN 46902 · United States
+UNSUBSCRIBE_SECRET=<generate: python -c "import secrets; print(secrets.token_hex(32))">
 ```
 
-**Increment warmup_day daily** (bump `warmup_day` by 1 in `.env` each morning).
-At day 22, the account is fully warmed and the 50/day cap applies.
+---
 
-**Check warmup status:**
+## Testing
+
 ```bash
-python -m src.outreach.warmup --status
+# Verify Resend is configured
+python -c "
+import os; os.environ['RESEND_API_KEY']='your-key'
+from src.notifications.transactional import send_transactional
+send_transactional('steele.stout@gmail.com', 'Test', '<p>Hello</p>', 'Hello')
+print('Resend OK')
+"
+
+# Verify Instantly is configured
+python -c "
+import os; os.environ['INSTANTLY_API_KEY']='your-key'
+from src.outreach.sender import send_email
+send_email(1, 'steele.stout@gmail.com', 'Test subject', 'Test body', dry_run=True)
+print('Instantly OK')
+"
+
+# Check DNS for SMTP fallback
+python -m src.outreach.domain_reputation mail.curbsite.co
 ```
-
----
-
-## Sending Limits and Rules
-
-Enforced by `src/outreach/deliverability.py`:
-
-- **Business hours only:** 8am–6pm Central (no sends at night)
-- **Random 45–180s delay** between each send (mimics human pacing)
-- **One domain per hour:** Never email two addresses at the same company in the same hour
-- **Daily hard cap:** Determined by warmup_day (max 50/day per account)
-- **Account rotation:** Multiple accounts round-robin automatically via `SENDER_ACCOUNTS`
-
----
-
-## CAN-SPAM Compliance Checklist
-
-Every email sent through `sender.py` automatically includes:
-
-- [x] Physical mailing address in footer (`CURBSITE_ADDRESS` from `.env`)
-- [x] One-click unsubscribe link (HMAC-signed, handled by `/unsubscribe` endpoint)
-- [x] `List-Unsubscribe` and `List-Unsubscribe-Post` headers
-- [x] `X-Mailer` header set to look like a real email client
-
-You are responsible for:
-- [ ] Not emailing anyone who has previously opted out (handled automatically — CRM blocks it)
-- [ ] Honoring unsubscribe requests within 10 business days (handled immediately by the system)
-- [ ] Keeping your physical address current in `CURBSITE_ADDRESS`
-
----
-
-## Pre-Send Checklist
-
-Before starting any outreach campaign:
-
-1. **Verify DNS:**
-   ```bash
-   python -m src.outreach.domain_reputation mail.curbsite.co
-   ```
-
-2. **Check warmup status:**
-   ```bash
-   python -m src.outreach.warmup --status
-   ```
-
-3. **Test with dry run:**
-   ```bash
-   python -m src.outreach.sender --dry-run --lead-id 1
-   ```
-
-4. **Confirm dashboard deliverability tab** shows bounce rate <2% and unsub rate <0.5%
-
-5. **Start with 3–5 test sends** to your own email addresses before going live
-
----
-
-## Troubleshooting
-
-**Emails landing in spam:**
-- Check SPF/DKIM/DMARC with the domain checker
-- Ensure you're not sending more than your warmup limit allows
-- Check for spam trigger words in subject/body
-- Switch from HTML to plain text for initial emails
-
-**Account getting flagged:**
-- Reduce volume immediately
-- Check bounce rate — if >2%, stop and clean your list
-- Add more sending accounts and spread the load
-
-**DNS propagation:**
-- DNS changes can take up to 48 hours to propagate globally
-- Test propagation: [mxtoolbox.com/SuperTool.aspx](https://mxtoolbox.com/SuperTool.aspx)
-- Use `nslookup -type=TXT your-domain.com` to check from your machine
