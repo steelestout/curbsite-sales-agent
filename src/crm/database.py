@@ -44,13 +44,15 @@ CREATE TABLE IF NOT EXISTS leads (
     review_count    INTEGER,
     social_links    TEXT,          -- JSON
     status          TEXT DEFAULT 'new',
-    -- new | scored | emailed | followed_up | mockup_sent | agreed_pending
-    -- agreed | building | build_ready | domain_purchased | deployed | live
-    -- lost | unsubscribed
+    -- new | scored | mockup_ready | emailed | followed_up | mockup_sent | agreed_pending
+    -- agreed | building | build_ready | domain_purchased | vps_provisioned | deployed | live
+    -- delivered (Track B) | lost | unsubscribed
     tier            TEXT,          -- 'entry' | 'mid' | 'top'
+    care_plan       REAL,          -- monthly care plan price; NULL = no care plan (→ Track B)
     domain          TEXT,          -- registered domain name once purchased
     source          TEXT,          -- 'yelp_scrape' | 'google_maps' | 'manual'
     review_needed   INTEGER DEFAULT 0,  -- 1 = flag for Steele to review
+    has_engagement  INTEGER DEFAULT 0,  -- 1 = prior email open/click (FCC gate for Rook)
     notes           TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
@@ -91,11 +93,11 @@ CREATE TABLE IF NOT EXISTS cost_log (
 );
 
 CREATE TABLE IF NOT EXISTS mockups (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    lead_id     INTEGER UNIQUE NOT NULL REFERENCES leads(id),
-    html_path   TEXT,
-    deploy_url  TEXT,
-    created_at  TEXT DEFAULT (datetime('now'))
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id      INTEGER UNIQUE NOT NULL REFERENCES leads(id),
+    html_path    TEXT,
+    netlify_url  TEXT,    -- public URL of the deployed mockup (used as email hook)
+    created_at   TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS builds (
@@ -113,6 +115,17 @@ CREATE TABLE IF NOT EXISTS domains (
     registrar      TEXT DEFAULT 'namecheap',
     purchase_date  TEXT,
     expiry_date    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS vps_instances (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id             INTEGER UNIQUE NOT NULL REFERENCES leads(id),
+    hetzner_server_id   INTEGER,       -- Hetzner Cloud server ID for deprovisioning
+    ip                  TEXT,          -- public IPv4 address
+    server_type         TEXT,          -- 'standard' | 'performance'
+    domain              TEXT,          -- client domain hosted on this VPS
+    monthly_cost        REAL,          -- USD/mo (~5 or ~9)
+    created_at          TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_leads_status   ON leads(status);

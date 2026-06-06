@@ -583,6 +583,27 @@ def build_site(
     lead_id = lead["id"]
     log.info("Building site for lead #%d: %s", lead_id, lead.get("business_name"))
 
+    # ── Gate: confirm client has uploaded assets to the portal ───────────────
+    # Tries to sync from curbsite.co/crm. If assets aren't ready, raises so
+    # the orchestrator can block and prompt Steele to follow up with the client.
+    try:
+        from src.build.portal_sync import assert_assets_ready, sync_client_assets
+        sync_client_assets(lead, force=False)   # pull latest from portal
+        ready = assert_assets_ready(lead, min_photos=1)
+        if not ready:
+            log.warning(
+                "Lead #%d (%s): portal assets not yet ready (need ≥1 photo + logo). "
+                "Ask the client to upload via curbsite.co/portal then retry.",
+                lead_id, lead.get("business_name"),
+            )
+            # Don't hard-block — proceed with placeholders and warn
+    except Exception as exc:
+        log.warning(
+            "Portal sync failed for lead #%d (%s): %s — proceeding with local assets / placeholders.",
+            lead_id, lead.get("business_name"), exc,
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     update_lead_status(lead_id, "building")
 
     # Merge CRM + intake data

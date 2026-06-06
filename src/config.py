@@ -74,13 +74,22 @@ NAMECHEAP_USERNAME: str = os.getenv("NAMECHEAP_USERNAME", "")
 NAMECHEAP_CLIENT_IP: str = os.getenv("NAMECHEAP_CLIENT_IP", "")
 NAMECHEAP_SANDBOX: bool = os.getenv("NAMECHEAP_SANDBOX", "0") == "1"
 
-# ── VPS deployment (Hostinger) ────────────────────────────────────────────────
-HOSTINGER_VPS_HOST: str = os.getenv("HOSTINGER_VPS_HOST", "")
+# ── VPS deployment (Hostinger — shared infra for curbsite.co itself) ─────────
+# NOTE: pk.ppk is PuTTY format. paramiko requires OpenSSH format.
+# Convert: puttygen pk.ppk -O private-openssh -o ~/.ssh/curbsite_rsa
+HOSTINGER_VPS_HOST: str = os.getenv("HOSTINGER_VPS_HOST", "187.77.5.53")
 HOSTINGER_VPS_USER: str = os.getenv("HOSTINGER_VPS_USER", "root")
 HOSTINGER_VPS_KEY_PATH: str = os.getenv(
-    "HOSTINGER_VPS_KEY_PATH", str(Path.home() / ".ssh" / "id_rsa")
+    "HOSTINGER_VPS_KEY_PATH", str(Path.home() / ".ssh" / "curbsite_rsa")
 )
-HOSTINGER_VPS_IP: str = os.getenv("HOSTINGER_VPS_IP", "")
+HOSTINGER_VPS_IP: str = os.getenv("HOSTINGER_VPS_IP", "187.77.5.53")
+
+# ── Client VPS provisioning (Hetzner — one VPS per client, Track A) ──────────
+# Standard CX22 (~$5/mo): salons, contractors, auto, fitness
+# Performance CX32 (~$9/mo): restaurants mid/top (online ordering load)
+HETZNER_API_TOKEN: str = os.getenv("HETZNER_API_TOKEN", "")
+HETZNER_DATACENTER: str = os.getenv("HETZNER_DATACENTER", "ash")   # Ashburn, VA
+HETZNER_SSH_KEY_NAME: str = os.getenv("HETZNER_SSH_KEY_NAME", "curbsite")
 
 # ── Reply monitoring (IMAP) ───────────────────────────────────────────────────
 IMAP_HOST: str = os.getenv("IMAP_HOST", "imap.gmail.com")
@@ -91,6 +100,20 @@ PORTAL_URL: str = os.getenv("CURBSITE_PORTAL_URL", "https://curbsite.co/portal")
 PORTAL_FILE_BASE_PATH: str = os.getenv(
     "PORTAL_FILE_BASE_PATH", str(Path(__file__).resolve().parent.parent / "data" / "portal_uploads")
 )
+
+# ── OpenClaw / Rook voice agent ───────────────────────────────────────────────
+OPENCLAW_API_KEY: str = os.getenv("OPENCLAW_API_KEY", "")
+OPENCLAW_AGENT_ID: str = os.getenv("OPENCLAW_AGENT_ID", "")
+OPENCLAW_API_BASE: str = os.getenv("OPENCLAW_API_BASE", "https://api.openclaw.ai/v1")
+
+# ── Founding clients ──────────────────────────────────────────────────────────
+# Number of free founding-client spots remaining (update as spots are filled)
+FOUNDING_CLIENTS_REMAINING: int = int(os.getenv("FOUNDING_CLIENTS_REMAINING", "5"))
+
+# ── Curbsite portal auth (for portal_sync.py) ─────────────────────────────────
+CURBSITE_OWNER_EMAIL: str = os.getenv("CURBSITE_OWNER_EMAIL", "steele.stout@gmail.com")
+CURBSITE_OWNER_PASSWORD: str = os.getenv("CURBSITE_OWNER_PASSWORD", "")
+CURBSITE_CRM_API_KEY: str = os.getenv("CURBSITE_CRM_API_KEY", "")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

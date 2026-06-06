@@ -3,23 +3,37 @@ Main orchestrator — runs the full Curbsite sales + build + deploy pipeline.
 
 State machine
 ─────────────
-new → scored → emailed → followed_up → mockup_sent → agreed_pending
-    → agreed → building → build_ready → domain_purchased → deployed → live
+new → scored → mockup_ready → emailed → followed_up → mockup_sent
+    → agreed_pending → agreed → building → build_ready
+    → domain_purchased → deployed → live
     (any stage → lost | unsubscribed)
 
 Stages
 ──────
 1. prospect       Scrape new leads (Yelp / Google Maps)
 2. score          AI-assisted lead scoring (0–100)
-3. outreach       Send personalised cold emails with Calendly link + pricing
+2b. mockup        Pre-outreach: generate mockup immediately after scoring
+                  The mockup URL is embedded in the first cold email as the hook
+3. outreach       Send personalised cold emails with mockup link + Calendly CTA
 4. followup       Automated Day-3 and Day-7 follow-up sequence
 5. dossier        Generate pre-call brief for every booked appointment
-6. mockup         Generate + deploy free mockup websites for qualified leads
-7. close          Monitor inbox for replies; classify + route (positive/negative/question)
-8. build          Full production site build from intake form + client assets
-9. domain         Purchase domain via Namecheap
-10. deploy        SSH deploy to Hostinger VPS + Traefik; update DNS
-11. golive        Poll for liveness; send client go-live notification
+6. close          Monitor inbox for replies; classify + route (positive/negative/question)
+7. build          Full production site build from intake form + client assets
+8. domain         Purchase domain via Namecheap
+9. deploy         Deploy site — Track A (dedicated Hetzner VPS) or Track B (zip handoff)
+10. golive        Poll for liveness; send client go-live notification
+
+Deployment tracks
+─────────────────
+Track A — Client signed up for maintenance plan:
+  Provision dedicated Hetzner VPS → SSH deploy → update DNS → go-live
+
+Track B — No maintenance plan (client hosts their own):
+  Build zip → email to client with README and hosting instructions
+
+The orchestrator auto-selects based on lead.care_plan:
+  care_plan IS NOT NULL → Track A
+  care_plan IS NULL     → Track B
 
 Gates (Steele's manual approvals)
 ──────────────────────────────────
@@ -31,13 +45,16 @@ GATE 2: Before go-live — Steele does visual QA of built site, then runs:
 
 Run via
 ───────
-  python -m src.orchestrator               # full top-of-funnel pipeline (steps 1–7)
-  python -m src.orchestrator --dry-run     # no emails, no deploys
-  python -m src.orchestrator --step close  # check inbox for replies
-  python -m src.orchestrator --step mockup # generate mockups for all emailed leads
-  python -m src.orchestrator --step build  --lead-id {id}  # GATE 1: build one site
-  python -m src.orchestrator --step deploy --lead-id {id}  # GATE 2: deploy one site
-  python -m src.orchestrator --step golive --lead-id {id}  # wait for live + notify
+  python -m src.orchestrator                     # full top-of-funnel (steps 1–6)
+  python -m src.orchestrator --dry-run           # no emails, no deploys
+  python -m src.orchestrator --step close        # check inbox for replies
+  python -m src.orchestrator --step mockup       # generate mockups for scored leads
+  python -m src.orchestrator --step build        --lead-id {id}   # GATE 1
+  python -m src.orchestrator --step domain       --lead-id {id}   # purchase domain
+  python -m src.orchestrator --step vps-provision --lead-id {id}  # Track A: provision VPS
+  python -m src.orchestrator --step deploy       --lead-id {id}   # GATE 2: deploy site
+  python -m src.orchestrator --step handoff      --lead-id {id}   # Track B: zip handoff
+  python -m src.orchestrator --step golive       --lead-id {id}   # wait for live + notify
 """
 
 import argparse
@@ -83,7 +100,11 @@ def step_score() -> None:
 
 def step_outreach(dry_run: bool = False) -> None:
     log.info("═══ STEP 3: OUTREACH ═══")
-    leads = get_leads(status="scored", min_score=SCORE_MIN_EMAIL, limit=50)
+    # Also pick up mockup_ready leads (scored + mockup generated before email)
+    leads_scored = get_leads(status="scored", min_score=SCORE_MIN_EMAIL, limit=50)
+    leads_mockup_ready = get_leads(status="mockup_ready", min_score=SCORE_MIN_EMAIL, limit=50)
+    lead_ids_seen = {l["id"] for l in leads_scored}
+    leads = leads_scored + [l for l in leads_mockup_ready if l["id"] not in lead_ids_seen]
     log.info(
         "Found %d leads ready for outreach (score >= %d)",
         len(leads), SCORE_MIN_EMAIL,
@@ -125,25 +146,43 @@ def step_dossiers() -> None:
     )
 
 
-def step_mockup(dry_run: bool = False) -> None:
+def step_mockup(dry_run: bool = False, pre_outreach: bool = False) -> None:
     """
-    Generate and deliver free mockups to all leads that have been emailed
-    or had a follow-up but haven't received a mockup yet.
-    Also covers leads in 'call_scheduled' status (post-Calendly booking).
+    Generate free mockups for leads.
+
+    Two modes:
+    1. Pre-outreach (pre_outreach=True): called right after scoring, before any email
+       is sent. Generates mockup and sets status to 'mockup_ready'. The URL gets
+       embedded in the very first cold email as the hook.
+    2. Post-outreach (default): generates + delivers mockups to leads who have been
+       emailed but haven't received a separate mockup delivery email yet. Also covers
+       call_scheduled leads.
     """
-    log.info("═══ STEP 6: MOCKUP GENERATION + DELIVERY ═══")
+    if pre_outreach:
+        log.info("═══ STEP 2b: PRE-OUTREACH MOCKUP GENERATION ═══")
+    else:
+        log.info("═══ STEP 6 (manual): MOCKUP GENERATION + DELIVERY ═══")
 
     from src.mockup.generator import generate_mockup
     from src.mockup.delivery import deliver_mockup
 
-    # Target: emailed, followed_up, or call_scheduled leads who haven't got a mockup
-    candidate_statuses = ["emailed", "followed_up", "call_scheduled"]
+    if pre_outreach:
+        # Only generate — don't send a separate delivery email.
+        # The URL will be picked up by compose_outreach_email() via _get_mockup_url().
+        candidate_statuses = ["scored"]
+        deliver = False
+    else:
+        # Full generate + deliver to leads who have been emailed but not yet had a
+        # dedicated mockup delivery email.
+        candidate_statuses = ["emailed", "followed_up", "call_scheduled"]
+        deliver = True
+
     candidates = []
     for status in candidate_statuses:
-        candidates.extend(get_leads(status=status, limit=50))
+        candidates.extend(get_leads(status=status, min_score=SCORE_MIN_EMAIL, limit=50))
 
     # Deduplicate
-    seen = set()
+    seen: set = set()
     unique_candidates = []
     for lead in candidates:
         if lead["id"] not in seen:
@@ -159,12 +198,24 @@ def step_mockup(dry_run: bool = False) -> None:
             continue
         try:
             html_path = generate_mockup(lead)
-            deliver_mockup(lead, html_path, dry_run=dry_run)
+            if deliver:
+                deliver_mockup(lead, html_path, dry_run=dry_run)
+            else:
+                # Pre-outreach: just update status so outreach picks it up
+                if not dry_run:
+                    update_lead_status(lead["id"], "mockup_ready")
+                log.info(
+                    "Pre-outreach mockup generated for lead #%d (%s) — URL will appear in first email.",
+                    lead["id"], lead.get("business_name"),
+                )
             generated += 1
         except Exception as exc:
-            log.error("Mockup failed for lead #%d (%s): %s", lead["id"], lead["business_name"], exc)
+            log.error(
+                "Mockup failed for lead #%d (%s): %s",
+                lead["id"], lead["business_name"], exc,
+            )
 
-    log.info("Done — %d mockups generated and delivered.", generated)
+    log.info("Done — %d mockups generated.", generated)
 
 
 def step_close(dry_run: bool = False) -> None:
@@ -232,12 +283,12 @@ def step_domain(lead_id: int, preferred_domain: str = None, dry_run: bool = Fals
         log.warning("Domain purchase failed or skipped — see logs above.")
 
 
-def step_deploy(lead_id: int, dry_run: bool = False) -> None:
+def step_vps_provision(lead_id: int, dry_run: bool = False) -> None:
     """
-    GATE 2 — Deploy a built site to Hostinger VPS.
-    Requires lead status = 'build_ready' and a domain in the CRM.
+    Track A only — Provision a dedicated Hetzner VPS for this client.
+    Run this BEFORE step_deploy for Track A clients.
     """
-    log.info("═══ STEP 10: VPS DEPLOY (lead #%d) ═══", lead_id)
+    log.info("═══ VPS PROVISION (lead #%d) ═══", lead_id)
 
     lead = get_lead(lead_id)
     if not lead:
@@ -247,26 +298,90 @@ def step_deploy(lead_id: int, dry_run: bool = False) -> None:
     domain = lead.get("domain")
     if not domain:
         log.error(
-            "No domain set for lead #%d. Run domain purchase first, or set it manually "
-            "with: UPDATE leads SET domain=? WHERE id=?",
-            lead_id, lead_id,
+            "No domain for lead #%d. Run --step domain first.",
+            lead_id,
         )
         return
 
-    from src.deploy.host import deploy_to_vps
-    from pathlib import Path
-    _ROOT = Path(__file__).resolve().parent.parent
+    if dry_run:
+        from src.deploy.vps_provisioner import _select_server_type, _SERVER_TYPES
+        stype = _select_server_type(lead)
+        specs = _SERVER_TYPES[stype]
+        log.info(
+            "[DRY RUN] Would provision %s VPS (%s: %d vCPU / %dGB RAM / ~$%d/mo) for %s",
+            stype, specs["type"], specs["cpu"], specs["ram"], specs["price_mo"],
+            lead.get("business_name"),
+        )
+        return
+
+    from src.deploy.vps_provisioner import provision_vps
+    ip = provision_vps(lead, domain)
+    if ip:
+        log.info("Done — VPS provisioned at %s for %s", ip, domain)
+    else:
+        log.error("VPS provisioning failed or skipped — check logs / set HETZNER_API_TOKEN.")
+
+
+def step_deploy(lead_id: int, track: str = None, dry_run: bool = False) -> None:
+    """
+    GATE 2 — Deploy a built site.
+
+    Track A (maintenance plan): SSH deploy to Hetzner VPS (run vps-provision first).
+    Track B (no maintenance): Zip + email handoff to client.
+
+    Auto-selects based on lead.care_plan if track is not specified.
+    """
+    lead = get_lead(lead_id)
+    if not lead:
+        log.error("Lead #%d not found.", lead_id)
+        return
+
+    domain = lead.get("domain")
+    if not domain:
+        log.error(
+            "No domain set for lead #%d. Run --step domain first, or set it manually.",
+            lead_id,
+        )
+        return
+
+    from pathlib import Path as _Path
+    _ROOT = _Path(__file__).resolve().parent.parent
     build_dir = _ROOT / "data" / "builds" / str(lead_id)
 
     if not build_dir.exists():
         log.error("Build directory not found: %s — run --step build first.", build_dir)
         return
 
-    success = deploy_to_vps(lead, build_dir, domain, dry_run=dry_run)
-    if success:
-        log.info("Done — deployed to https://%s", domain)
+    # Determine track
+    if not track:
+        track = "a" if lead.get("care_plan") else "b"
+        log.info(
+            "Auto-selected Track %s for lead #%d (%s care_plan)",
+            track.upper(), lead_id,
+            "has" if track == "a" else "no",
+        )
+
+    if track.lower() == "a":
+        log.info("═══ STEP DEPLOY — TRACK A: VPS DEPLOY (lead #%d) ═══", lead_id)
+        from src.deploy.host import deploy_to_vps
+        success = deploy_to_vps(lead, build_dir, domain, dry_run=dry_run)
+        if success:
+            log.info("Done — deployed to https://%s", domain)
+        else:
+            log.error("Deploy failed for lead #%d", lead_id)
     else:
-        log.error("Deploy failed for lead #%d", lead_id)
+        log.info("═══ STEP DEPLOY — TRACK B: ZIP HANDOFF (lead #%d) ═══", lead_id)
+        from src.deploy.handoff import deliver_handoff
+        zip_path = deliver_handoff(lead, build_dir, domain, dry_run=dry_run)
+        if zip_path:
+            log.info("Done — handoff zip sent: %s", zip_path.name)
+        else:
+            log.error("Handoff failed for lead #%d", lead_id)
+
+
+def step_handoff(lead_id: int, dry_run: bool = False) -> None:
+    """Track B shortcut — explicitly run the zip handoff for a specific lead."""
+    step_deploy(lead_id, track="b", dry_run=dry_run)
 
 
 def step_golive(lead_id: int, dry_run: bool = False) -> None:
@@ -303,14 +418,24 @@ def run_top_of_funnel(dry_run: bool = False, yelp_key: str = None) -> None:
     """
     Run all automated top-of-funnel steps (prospect → close monitoring).
     Does NOT build or deploy — those require Steele's approval at two gates.
+
+    Order:
+    1. Prospect new leads
+    2. Score them
+    2b. Generate pre-outreach mockups (for scored leads meeting threshold)
+        → URLs get embedded automatically in the first cold email
+    3. Send cold emails (mockup URL is the hook)
+    4. Process follow-up sequence
+    5. Generate dossiers for booked calls
+    6. Monitor inbox for replies
     """
     init_db()
     step_prospect(yelp_key=yelp_key)
     step_score()
+    step_mockup(dry_run=dry_run, pre_outreach=True)   # generate BEFORE sending email
     step_outreach(dry_run=dry_run)
     step_followup(dry_run=dry_run)
     step_dossiers()
-    step_mockup(dry_run=dry_run)
     step_close(dry_run=dry_run)
     log.info("═══ TOP-OF-FUNNEL COMPLETE ═══")
     log.info(
@@ -329,11 +454,17 @@ def main() -> None:
         choices=[
             "prospect", "score", "outreach", "followup",
             "dossiers", "mockup", "close",
-            "build", "domain", "deploy", "golive",
+            "build", "domain", "vps-provision", "deploy", "handoff", "golive",
             "report", "all",
         ],
         default="all",
         help="Which step to run (default: all = top-of-funnel only)",
+    )
+    parser.add_argument(
+        "--track",
+        choices=["a", "b", "A", "B"],
+        default=None,
+        help="Deployment track for --step deploy: a=VPS (maintenance plan), b=zip handoff",
     )
     parser.add_argument(
         "--dry-run",
@@ -366,7 +497,8 @@ def main() -> None:
     init_db()
 
     # Single-lead dossier shortcut (legacy)
-    if args.lead_id and args.step not in ("build", "domain", "deploy", "golive", "dossiers"):
+    _lead_required_steps = ("build", "domain", "vps-provision", "deploy", "handoff", "golive", "dossiers")
+    if args.lead_id and args.step not in _lead_required_steps:
         from src.crm.dossier import generate_dossier
         dossier = generate_dossier(args.lead_id)
         print(dossier)
@@ -399,10 +531,18 @@ def main() -> None:
             if not args.lead_id:
                 parser.error("--step domain requires --lead-id")
             step_domain(args.lead_id, preferred_domain=args.domain, dry_run=args.dry_run)
+        case "vps-provision":
+            if not args.lead_id:
+                parser.error("--step vps-provision requires --lead-id")
+            step_vps_provision(args.lead_id, dry_run=args.dry_run)
         case "deploy":
             if not args.lead_id:
                 parser.error("--step deploy requires --lead-id")
-            step_deploy(args.lead_id, dry_run=args.dry_run)
+            step_deploy(args.lead_id, track=args.track, dry_run=args.dry_run)
+        case "handoff":
+            if not args.lead_id:
+                parser.error("--step handoff requires --lead-id")
+            step_handoff(args.lead_id, dry_run=args.dry_run)
         case "golive":
             if not args.lead_id:
                 parser.error("--step golive requires --lead-id")
