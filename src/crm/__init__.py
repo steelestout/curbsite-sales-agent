@@ -11,3 +11,4 @@ from .database import (
     mark_followup_sent,
     log_cost,
 )
+from .dossier import generate_dossier, generate_all_booked_dossiers

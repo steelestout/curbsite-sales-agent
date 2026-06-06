@@ -1,100 +1,73 @@
 """
-Email composer — generates personalised cold outreach emails using AI.
+Email composer — generates personalised cold outreach and follow-up emails.
 
-Templates
-─────────
-- no_website:  business has no website at all
-- poor_website: business has an outdated/poor website
-- generic:     fallback for anything else
+Design principles
+─────────────────
+1. Every email references Curbsite's ballpark pricing so prospects self-qualify.
+   No price surprises on the call = more committed bookings.
+2. Every email includes the Calendly booking link as the primary CTA.
+3. Keep it short. 5–7 sentences max. No bullet lists. Human tone.
+4. gpt-4o-mini for most leads (cheap, fast, cached follow-ups).
+   gpt-4o only for leads scored >= 75 (higher quality draft for hot leads).
+5. Follow-ups add value (a tip, an example) rather than just nagging.
 
-Each template uses gpt-4o-mini (cheap) by default.
-High-score leads (>= 75) get gpt-4o for final polish.
+Sequence overview
+─────────────────
+  Day 0  — Initial cold email  (score >= SCORE_MIN_EMAIL)
+  Day 3  — Follow-up 1: quick observation / social proof
+  Day 7  — Follow-up 2: final touch, low-pressure, leave door open
 """
 
+import json
 import logging
 from typing import Optional
 
-from src.config import AGENCY_NAME, AGENCY_URL, AGENCY_OWNER, SCORE_VOICE_THRESHOLD
+from src.config import AGENCY_NAME, AGENCY_URL, AGENCY_OWNER, REPLY_TO
 from src.ai_client import draft_email
+from src.outreach.pricing import recommend_tier, TierRecommendation
+from src.outreach.calendly import booking_cta, booking_link
 
 log = logging.getLogger(__name__)
 
-# ── System prompt (shared across templates) ───────────────────────────────────
-_SYSTEM = f"""You are a friendly, sharp sales copywriter for {AGENCY_NAME} ({AGENCY_URL}), \
-a web design agency. You write SHORT, natural cold outreach emails — NOT spam, NOT corporate fluff.
 
-Rules:
-- Subject line: under 10 words, curiosity-driven, no clickbait
-- Body: 4–6 sentences max. No bullet lists. Conversational tone.
-- One clear CTA: schedule a free 15-min call or reply to this email.
-- Sign as {AGENCY_OWNER} from {AGENCY_NAME}.
-- NEVER mention competitors by name.
-- Output format: SUBJECT: <line>\nBODY:\n<body>
-"""
+# ── Shared system prompt ───────────────────────────────────────────────────────
 
-
-def _build_user_prompt(
-    business_name: str,
-    owner_name: Optional[str],
-    niche: str,
-    city: str,
-    website_quality: str,
-    score_reasons: list[str],
-) -> str:
-    greeting = f"Hi {owner_name}" if owner_name else f"Hi there"
-    reasons_summary = "; ".join(score_reasons[:3]) if score_reasons else ""
-
-    if website_quality == "none":
-        situation = f"{business_name} does not appear to have a website."
-    elif website_quality == "poor":
-        situation = f"{business_name} has a website but it looks outdated or isn't mobile-friendly."
-    else:
-        situation = f"{business_name} has a decent website but there may be room to grow online."
-
+def _system_prompt(extra: str = "") -> str:
     return (
-        f"Write a cold email to the owner of {business_name}, a {niche} in {city}.\n"
-        f"Greeting: {greeting}\n"
-        f"Situation: {situation}\n"
-        f"Key insight: {reasons_summary}\n"
-        f"Goal: get them on a free 15-min call or to reply with interest."
+        f"You are a friendly, sharp sales copywriter for {AGENCY_NAME} ({AGENCY_URL}), "
+        "a web design agency that builds custom sites for small businesses — "
+        "restaurants, contractors, photographers, salons, and more.\n\n"
+        "Writing rules:\n"
+        "- Subject line: under 10 words. Curious, specific, no clickbait. No emojis.\n"
+        "- Body: 4–6 sentences max. NO bullet lists. Conversational, warm, direct.\n"
+        "- Mention the ballpark price range naturally — not as a hard sell, "
+        "just so the reader knows what world we're in.\n"
+        "- End with ONE clear CTA: book the free 15-min call via the provided link.\n"
+        f"- Sign off as {AGENCY_OWNER} from {AGENCY_NAME}.\n"
+        "- Sound like a real person, not a marketing email.\n"
+        "- NEVER use phrases like 'I hope this email finds you well', "
+        "'leverage', 'synergy', 'touch base', or 'circle back'.\n"
+        f"{extra}\n"
+        "Output format ONLY:\n"
+        "SUBJECT: <subject line>\n"
+        "BODY:\n<email body>"
     )
 
 
-def compose_outreach_email(lead: dict) -> tuple[str, str]:
-    """
-    Generate (subject, body) for a lead.
-    Returns (subject, body) strings.
-    """
-    import json
-    score = lead.get("score", 0)
-    score_reasons = []
-    if lead.get("score_reasons"):
-        try:
-            score_reasons = json.loads(lead["score_reasons"])
-        except (ValueError, TypeError):
-            pass
+# ── Parser ─────────────────────────────────────────────────────────────────────
 
-    high_quality = score >= 75  # use gpt-4o for top leads
-
-    prompt = _build_user_prompt(
-        business_name=lead.get("business_name", "your business"),
-        owner_name=lead.get("owner_name"),
-        niche=lead.get("niche", "business"),
-        city=lead.get("city", "your area"),
-        website_quality=lead.get("website_quality", "none"),
-        score_reasons=score_reasons,
-    )
-
-    raw = draft_email(_SYSTEM, prompt, high_quality=high_quality)
-
-    # Parse SUBJECT / BODY
-    subject = ""
+def _parse_subject_body(raw: str, fallback_subject: str) -> tuple[str, str]:
+    """Parse 'SUBJECT: ...\nBODY:\n...' format from AI output."""
+    subject = fallback_subject
     body = raw
+
     if "SUBJECT:" in raw and "BODY:" in raw:
-        parts = raw.split("BODY:", 1)
-        subject_part = parts[0].replace("SUBJECT:", "").strip()
-        body = parts[1].strip()
-        subject = subject_part.split("\n")[0].strip()
+        try:
+            s_part, b_part = raw.split("BODY:", 1)
+            subject = s_part.replace("SUBJECT:", "").strip().split("\n")[0].strip()
+            body = b_part.strip()
+        except ValueError:
+            pass
     elif "SUBJECT:" in raw:
         lines = raw.split("\n")
         for i, line in enumerate(lines):
@@ -103,42 +76,166 @@ def compose_outreach_email(lead: dict) -> tuple[str, str]:
                 body = "\n".join(lines[i + 1:]).strip()
                 break
 
-    if not subject:
-        subject = f"Quick question about {lead.get('business_name', 'your business')}'s online presence"
+    return subject, body
+
+
+# ── Initial cold email ─────────────────────────────────────────────────────────
+
+def compose_outreach_email(lead: dict) -> tuple[str, str]:
+    """
+    Generate (subject, body) for the initial cold email to a lead.
+    Embeds Calendly link and pricing tier reference.
+    """
+    score = lead.get("score", 0)
+    high_quality = score >= 75  # gpt-4o for hot leads only
+
+    # Tier recommendation
+    rec: TierRecommendation = recommend_tier(lead)
+
+    # Score reasons for context
+    score_reasons: list[str] = []
+    if lead.get("score_reasons"):
+        try:
+            score_reasons = json.loads(lead["score_reasons"])
+        except (ValueError, TypeError):
+            pass
+
+    # Build Calendly CTA
+    cal_cta = booking_cta(lead, campaign="cold_email")
+    cal_link = booking_link(lead, campaign="cold_email")
+
+    # Website situation summary
+    wq = lead.get("website_quality", "none")
+    if wq == "none":
+        web_situation = f"{lead.get('business_name')} doesn't appear to have a website."
+    elif wq == "poor":
+        web_situation = (
+            f"{lead.get('business_name')} has a website, but it looks outdated "
+            "and likely isn't showing up well on mobile or in local search."
+        )
+    else:
+        web_situation = (
+            f"{lead.get('business_name')} has a decent web presence, "
+            "though there's room to grow in local search and conversions."
+        )
+
+    owner = lead.get("owner_name")
+    greeting = f"Hi {owner}" if owner else "Hi there"
+
+    user_prompt = (
+        f"Write a cold outreach email to the owner of {lead.get('business_name')}, "
+        f"a {lead.get('niche')} in {lead.get('city')}, {lead.get('state')}.\n\n"
+        f"Greeting: {greeting}\n"
+        f"Web situation: {web_situation}\n"
+        f"Key insight: {'; '.join(score_reasons[:2]) if score_reasons else 'Strong local reputation with weak online presence.'}\n"
+        f"Recommended package: {rec.label} — {rec.email_mention}\n"
+        f"Pitch angle: {rec.pitch_angle}\n\n"
+        f"End the email with this exact booking CTA (copy it verbatim, do not paraphrase):\n"
+        f"{cal_cta}\n\n"
+        f"The booking link is: {cal_link}"
+    )
+
+    raw = draft_email(_system_prompt(), user_prompt, high_quality=high_quality)
+    subject, body = _parse_subject_body(
+        raw,
+        fallback_subject=f"Quick question about {lead.get('business_name', 'your business')}",
+    )
+
+    # Guarantee the Calendly link appears in the body even if AI dropped it
+    if cal_link not in body and "calendly.com" not in body.lower():
+        body += f"\n\n{cal_cta}"
 
     return subject, body
+
+
+# ── Follow-up emails ───────────────────────────────────────────────────────────
+
+_FOLLOWUP_CONTEXT = {
+    1: (
+        "This is follow-up #1, sent 3 days after the initial email. "
+        "Keep it to 2–3 sentences. Reference that you emailed before. "
+        "Add a small piece of genuine value: mention one specific thing they could improve "
+        "(e.g., their Google Business Profile, a missing mobile feature). "
+        "End with the booking link — no pressure."
+    ),
+    2: (
+        "This is follow-up #2 — the final touch, sent 7 days after the initial email. "
+        "Keep it to 2–3 sentences. Acknowledge this is the last nudge. "
+        "Leave the door completely open ('no worries if the timing isn't right'). "
+        "Mention that the Calendly link is there whenever they're ready. "
+        "End warm, not salesy."
+    ),
+}
 
 
 def compose_followup_email(lead: dict, step: int) -> tuple[str, str]:
     """
-    Generate a follow-up email (step 1 = first follow-up, step 2 = final nudge).
+    Generate (subject, body) for a follow-up email.
+    step=1 → Day 3 follow-up
+    step=2 → Day 7 final nudge
     """
-    system = _SYSTEM + (
-        "\nThis is a follow-up email. Reference that you emailed before. "
-        "Keep it very short (2-3 sentences). Don't be pushy. Add value."
-    )
+    context = _FOLLOWUP_CONTEXT.get(step, _FOLLOWUP_CONTEXT[2])
+    cal_link = booking_link(lead, campaign=f"followup_{step}")
 
-    step_context = {
-        1: "First follow-up, 3 days after initial email. Friendly check-in.",
-        2: "Final follow-up, 7 days after initial. Low-pressure, leave the door open.",
-    }.get(step, "Follow-up email.")
-
-    user = (
-        f"Write a follow-up email for {lead.get('business_name')}, "
+    user_prompt = (
+        f"Write a follow-up email to the owner of {lead.get('business_name')}, "
         f"a {lead.get('niche')} in {lead.get('city')}.\n"
-        f"Context: {step_context}"
+        f"Website quality: {lead.get('website_quality', 'none')}\n"
+        f"Context: {context}\n\n"
+        f"Booking link (include it): {cal_link}"
     )
 
-    raw = draft_email(system, user, high_quality=False)
+    extra = (
+        "This is a follow-up. Do NOT restate the full pitch. "
+        "Be brief, add one new observation or value point, and include the link."
+    )
 
-    subject = ""
-    body = raw
-    if "SUBJECT:" in raw and "BODY:" in raw:
-        parts = raw.split("BODY:", 1)
-        subject = parts[0].replace("SUBJECT:", "").strip().split("\n")[0]
-        body = parts[1].strip()
+    raw = draft_email(_system_prompt(extra=extra), user_prompt, high_quality=False)
+    subject, body = _parse_subject_body(
+        raw,
+        fallback_subject=f"Re: {lead.get('business_name', 'your website')}",
+    )
 
-    if not subject:
-        subject = f"Re: {lead.get('business_name', 'your business')}"
+    # Guarantee link is present
+    if cal_link not in body and "calendly.com" not in body.lower():
+        body += f"\n\n{cal_link}"
 
     return subject, body
+
+
+# ── LinkedIn / social DM (optional) ───────────────────────────────────────────
+
+def compose_linkedin_dm(lead: dict) -> str:
+    """
+    Generate a short LinkedIn connection message or DM.
+    Max 300 characters (connection note limit).
+    """
+    rec = recommend_tier(lead)
+    cal_link = booking_link(lead, campaign="linkedin")
+
+    system = (
+        "Write a LinkedIn connection request note for a web design agency reaching out "
+        "to a small business owner. Max 280 characters. Friendly, specific, no buzzwords. "
+        "Mention one specific thing about their business. End with a quick call offer. "
+        "Output ONLY the message text, nothing else."
+    )
+    user = (
+        f"Target: {lead.get('business_name')}, a {lead.get('niche')} in {lead.get('city')}. "
+        f"They {('have no website' if lead.get('website_quality') == 'none' else 'have an outdated website')}. "
+        f"Recommended: {rec.label} ({rec.email_mention}). "
+        f"Calendly: {cal_link}"
+    )
+
+    from src.ai_client import chat
+    from src.config import MODEL_DEFAULT
+    return chat(
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        model=MODEL_DEFAULT,
+        max_tokens=100,
+        temperature=0.5,
+        operation="linkedin_dm",
+        use_cache=False,
+    )

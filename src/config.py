@@ -42,14 +42,16 @@ TARGET_NICHES: list[str] = [
     if n.strip()
 ]
 
-# ── Scoring ──────────────────────────────────────────────────────────────────
-SCORE_MIN_EMAIL: int = int(os.getenv("SCORE_MIN_EMAIL", "40"))
-SCORE_VOICE_THRESHOLD: int = int(os.getenv("SCORE_VOICE_THRESHOLD", "85"))
+# ── Calendly ─────────────────────────────────────────────────────────────────
+CALENDLY_URL: str = os.getenv("CALENDLY_URL", "")
+CALENDLY_WEBHOOK_SECRET: str = os.getenv("CALENDLY_WEBHOOK_SECRET", "")
 
-# ── OpenClaw voice agent ─────────────────────────────────────────────────────
-OPENCLAW_ENABLED: bool = os.getenv("OPENCLAW_ENABLED", "false").lower() == "true"
-OPENCLAW_API_KEY: str = os.getenv("OPENCLAW_API_KEY", "")
-OPENCLAW_AGENT_ID: str = os.getenv("OPENCLAW_AGENT_ID", "")
+# ── Scoring ───────────────────────────────────────────────────────────────────
+SCORE_MIN_EMAIL: int = int(os.getenv("SCORE_MIN_EMAIL", "40"))
+
+# ── Voice calling — intentionally disabled ────────────────────────────────────
+# See src/outreach/openclaw.py for the full rationale (FCC compliance + trust).
+VOICE_ENABLED: bool = False
 
 # ── Rate limits ───────────────────────────────────────────────────────────────
 MAX_EMAILS_PER_DAY: int = int(os.getenv("MAX_EMAILS_PER_DAY", "25"))
