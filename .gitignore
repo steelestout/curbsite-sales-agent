@@ -17,6 +17,9 @@ venv/
 env/
 *.egg
 
+# DKIM private key — never commit
+data/email/dkim/dkim_private.pem
+
 # Data / cache (don't commit leads, cached AI responses, or generated sites)
 data/cache/
 data/leads/*.db
