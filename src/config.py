@@ -65,5 +65,32 @@ CACHE_DIR: Path = _ROOT / os.getenv("CACHE_DIR", "data/cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# ── Mockup hosting (Netlify) ──────────────────────────────────────────────────
+NETLIFY_ACCESS_TOKEN: str = os.getenv("NETLIFY_ACCESS_TOKEN", "")
+
+# ── Domain registration (Namecheap) ──────────────────────────────────────────
+NAMECHEAP_API_KEY: str = os.getenv("NAMECHEAP_API_KEY", "")
+NAMECHEAP_USERNAME: str = os.getenv("NAMECHEAP_USERNAME", "")
+NAMECHEAP_CLIENT_IP: str = os.getenv("NAMECHEAP_CLIENT_IP", "")
+NAMECHEAP_SANDBOX: bool = os.getenv("NAMECHEAP_SANDBOX", "0") == "1"
+
+# ── VPS deployment (Hostinger) ────────────────────────────────────────────────
+HOSTINGER_VPS_HOST: str = os.getenv("HOSTINGER_VPS_HOST", "")
+HOSTINGER_VPS_USER: str = os.getenv("HOSTINGER_VPS_USER", "root")
+HOSTINGER_VPS_KEY_PATH: str = os.getenv(
+    "HOSTINGER_VPS_KEY_PATH", str(Path.home() / ".ssh" / "id_rsa")
+)
+HOSTINGER_VPS_IP: str = os.getenv("HOSTINGER_VPS_IP", "")
+
+# ── Reply monitoring (IMAP) ───────────────────────────────────────────────────
+IMAP_HOST: str = os.getenv("IMAP_HOST", "imap.gmail.com")
+IMAP_PORT: int = int(os.getenv("IMAP_PORT", "993"))
+
+# ── Owner portal ──────────────────────────────────────────────────────────────
+PORTAL_URL: str = os.getenv("CURBSITE_PORTAL_URL", "https://curbsite.co/portal")
+PORTAL_FILE_BASE_PATH: str = os.getenv(
+    "PORTAL_FILE_BASE_PATH", str(Path(__file__).resolve().parent.parent / "data" / "portal_uploads")
+)
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

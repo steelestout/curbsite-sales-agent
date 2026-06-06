@@ -29,6 +29,9 @@ tenacity>=8.3.0      # retry logic
 diskcache>=5.6.3     # disk-based cache
 phonenumbers>=8.13.0
 
+# VPS deployment
+paramiko>=3.4.0          # SSH/SFTP to Hostinger VPS
+
 # Testing
 pytest>=8.2.0
 pytest-mock>=3.14.0

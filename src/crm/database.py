@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS leads (
     niche           TEXT,
     city            TEXT,
     state           TEXT,
+    address         TEXT,
+    hours           TEXT,
     score           INTEGER DEFAULT 0,
     score_reasons   TEXT,          -- JSON list of reason strings
     has_website     INTEGER DEFAULT 0,
@@ -42,8 +44,13 @@ CREATE TABLE IF NOT EXISTS leads (
     review_count    INTEGER,
     social_links    TEXT,          -- JSON
     status          TEXT DEFAULT 'new',
-    -- new | emailed | followed_up | call_scheduled | won | lost | unsubscribed
+    -- new | scored | emailed | followed_up | mockup_sent | agreed_pending
+    -- agreed | building | build_ready | domain_purchased | deployed | live
+    -- lost | unsubscribed
+    tier            TEXT,          -- 'entry' | 'mid' | 'top'
+    domain          TEXT,          -- registered domain name once purchased
     source          TEXT,          -- 'yelp_scrape' | 'google_maps' | 'manual'
+    review_needed   INTEGER DEFAULT 0,  -- 1 = flag for Steele to review
     notes           TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
@@ -83,9 +90,35 @@ CREATE TABLE IF NOT EXISTS cost_log (
     logged_at   TEXT DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_leads_status  ON leads(status);
-CREATE INDEX IF NOT EXISTS idx_leads_score   ON leads(score DESC);
-CREATE INDEX IF NOT EXISTS idx_leads_email   ON leads(email);
+CREATE TABLE IF NOT EXISTS mockups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id     INTEGER UNIQUE NOT NULL REFERENCES leads(id),
+    html_path   TEXT,
+    deploy_url  TEXT,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS builds (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id     INTEGER UNIQUE NOT NULL REFERENCES leads(id),
+    site_path   TEXT,
+    status      TEXT DEFAULT 'pending',  -- 'pending' | 'building' | 'ready' | 'deployed'
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS domains (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id        INTEGER UNIQUE NOT NULL REFERENCES leads(id),
+    domain_name    TEXT NOT NULL,
+    registrar      TEXT DEFAULT 'namecheap',
+    purchase_date  TEXT,
+    expiry_date    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_leads_status   ON leads(status);
+CREATE INDEX IF NOT EXISTS idx_leads_score    ON leads(score DESC);
+CREATE INDEX IF NOT EXISTS idx_leads_email    ON leads(email);
+CREATE INDEX IF NOT EXISTS idx_leads_review   ON leads(review_needed);
 CREATE INDEX IF NOT EXISTS idx_followup_sched ON followup_queue(scheduled_for, sent);
 """
 

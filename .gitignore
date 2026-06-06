@@ -10,18 +10,21 @@ __pycache__/
 .Python
 *.egg-info/
 dist/
-build/
 .eggs/
+# Note: src/build/ is intentional Python source, not a build artifact
 venv/
 .venv/
 env/
 *.egg
 
-# Data / cache (don't commit leads or cached AI responses)
+# Data / cache (don't commit leads, cached AI responses, or generated sites)
 data/cache/
 data/leads/*.db
 data/leads/*.csv
 data/leads/*.json
+data/mockups/*/
+data/builds/*/
+data/portal_uploads/*/
 
 # Logs
 *.log
