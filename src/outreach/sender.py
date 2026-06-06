@@ -1,32 +1,20 @@
 """
-Cold outreach email sender — Instantly.ai (primary) with SMTP fallback.
+Cold outreach email sender — SMTP with account rotation, warmup, and deliverability gates.
 
-Instantly.ai is purpose-built for cold email: it handles inbox warming,
-account rotation, deliverability monitoring, reply detection, and unsubscribe
-compliance. This is the right tool for reaching prospects who haven't signed up.
+Sends from the dedicated outreach domain (OUTREACH_DOMAIN, e.g. getcurbsite.co),
+keeping curbsite.co completely isolated from cold email risk.
 
-Architecture decision:
-  INSTANTLY_API_KEY set  →  cold email routed through Instantly.ai
-  INSTANTLY_API_KEY unset → SMTP multi-account fallback (warmup + rate limits)
+Features:
+  • Round-robin across multiple sending accounts (SENDER_ACCOUNTS JSON in .env)
+  • Warmup-aware daily caps: 5 → 15 → 30 → 50 emails/day over 4 weeks
+  • Business hours gate (8am–6pm Central), 45–180s random inter-send delays
+  • One domain per hour cooldown (prevents domain reputation hits)
+  • DB-backed queue: when all accounts are at their daily cap, email is held
+    and retried at 8am Central the next business day
+  • CAN-SPAM footer + List-Unsubscribe header on every send
+  • Hard block on unsubscribed and hard-bounced leads
 
-Two Instantly send modes (set via INSTANTLY_CAMPAIGN_ID in .env):
-  Campaign mode  (INSTANTLY_CAMPAIGN_ID set):
-    Add the prospect to an Instantly campaign. Instantly controls scheduling,
-    warming, rotation, and multi-step follow-up sequences automatically.
-    This is the recommended mode for cold outreach sequences.
-
-  Direct send mode (INSTANTLY_CAMPAIGN_ID not set):
-    Use Instantly's email send API to dispatch a one-off email through
-    a connected inbox. Useful for single-shot sends outside of a campaign.
-
-Compliance guardrails (enforced regardless of which path is used):
-  • Unsubscribed leads → permanently blocked
-  • Hard-bounced leads → permanently blocked
-  • CAN-SPAM footer injected by compliance.py
-  • Every send logged to outreach_log in the CRM
-
-Sign up: https://instantly.ai  |  API docs: https://developer.instantly.ai
-Pricing: ~$37/mo for Hypergrowth (unlimited accounts + warming included)
+Separate from transactional email → see src/notifications/transactional.py (Resend).
 """
 
 import json
@@ -50,12 +38,7 @@ from src.outreach.compliance import (
 
 log = logging.getLogger(__name__)
 
-_INSTANTLY_API_KEY: str = os.getenv("INSTANTLY_API_KEY", "")
-_INSTANTLY_CAMPAIGN_ID: str = os.getenv("INSTANTLY_CAMPAIGN_ID", "")
-_INSTANTLY_FROM_EMAIL: str = os.getenv("INSTANTLY_FROM_EMAIL", FROM_EMAIL)
-
-# Round-robin cursor for SMTP fallback
-_account_cursor = 0
+_account_cursor = 0  # Round-robin state across calls
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -70,15 +53,13 @@ def send_email(
     plain_text_only: bool = False,
 ) -> bool:
     """
-    Send a cold outreach email to a prospect.
+    Send a cold outreach email to a prospect via SMTP with account rotation.
 
-    Routes through Instantly.ai if INSTANTLY_API_KEY is set, otherwise falls
-    back to SMTP multi-account rotation with warmup rate limits.
-
-    plain_text_only=True strips HTML — use this for initial cold emails.
-    Returns True on success or queue. False only on hard failures.
+    plain_text_only=True strips HTML — recommended for all initial cold emails
+    (plain text has dramatically better deliverability for cold outreach).
+    Returns True on success or queue. Returns False only on hard failures
+    (unsubscribed, bounced, or SMTP error after retries).
     """
-    # Hard compliance blocks
     if is_unsubscribed(lead_id):
         log.debug("Skipping lead #%d — unsubscribed.", lead_id)
         return False
@@ -94,9 +75,6 @@ def send_email(
         log.info("[DRY RUN] Cold email to %s — Subject: %s", to_email, subject)
         log_outreach(lead_id, "email", subject, body, sender_email="dry_run")
         return True
-
-    if _INSTANTLY_API_KEY:
-        return _send_via_instantly(lead_id, to_email, subject, body, html_body)
 
     return _send_via_smtp_rotation(lead_id, to_email, subject, body, html_body)
 
@@ -138,150 +116,15 @@ def process_queue(dry_run: bool = False) -> int:
 
 
 def reset_daily_counter() -> None:
-    """Compatibility shim — rate limits are now DB-based or managed by Instantly."""
-    log.debug("reset_daily_counter: no-op (limits are managed by Instantly or the DB).")
+    """Compatibility shim — daily limits are managed by the DB (outreach_log counts)."""
+    log.debug("reset_daily_counter: no-op (limits tracked via outreach_log).")
 
 
-# ── Instantly.ai ──────────────────────────────────────────────────────────────
-
-def _send_via_instantly(
-    lead_id: int,
-    to_email: str,
-    subject: str,
-    body: str,
-    html_body: str,
-) -> bool:
-    """
-    Route a cold email through Instantly.ai.
-
-    Campaign mode (INSTANTLY_CAMPAIGN_ID set):
-      Adds the prospect to an Instantly campaign. Instantly controls the send
-      schedule, inbox warming, account rotation, and follow-up steps.
-      Recommended for systematic outreach sequences.
-
-    Direct send mode (no campaign ID):
-      Sends a one-off email immediately through a connected Instantly inbox.
-      Use for ad-hoc single sends.
-    """
-    if _INSTANTLY_CAMPAIGN_ID:
-        return _instantly_add_to_campaign(lead_id, to_email)
-    return _instantly_direct_send(lead_id, to_email, subject, body, html_body)
-
-
-def _instantly_add_to_campaign(lead_id: int, to_email: str) -> bool:
-    """
-    Add a prospect to an Instantly campaign.
-    Instantly handles scheduling, warming, rotation, and multi-step follow-ups.
-
-    API: POST https://api.instantly.ai/api/v1/lead/add
-    Docs: https://developer.instantly.ai/leads/add-leads-to-a-campaign
-    """
-    try:
-        import requests
-    except ImportError:
-        log.error("requests package required — run: pip install requests")
-        return False
-
-    payload = {
-        "api_key": _INSTANTLY_API_KEY,
-        "campaign_id": _INSTANTLY_CAMPAIGN_ID,
-        "email": to_email,
-        "personalization_fields": {"lead_id": str(lead_id)},
-    }
-
-    try:
-        resp = requests.post(
-            "https://api.instantly.ai/api/v1/lead/add",
-            json=payload,
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            log.info(
-                "Lead #%d (%s) added to Instantly campaign %s",
-                lead_id, to_email, _INSTANTLY_CAMPAIGN_ID,
-            )
-            log_outreach(lead_id, "email", "via Instantly campaign", "", sender_email="instantly")
-            update_lead_status(lead_id, "emailed")
-            return True
-
-        log.warning(
-            "Instantly campaign add failed (%d): %s",
-            resp.status_code, resp.text[:300],
-        )
-    except Exception as e:
-        log.error("Instantly campaign add error: %s", e)
-
-    log.info("Falling back to SMTP for lead #%d", lead_id)
-    return False
-
-
-def _instantly_direct_send(
-    lead_id: int,
-    to_email: str,
-    subject: str,
-    body: str,
-    html_body: str,
-) -> bool:
-    """
-    Send a one-off email through Instantly's connected inboxes.
-
-    API: POST https://api.instantly.ai/api/v2/emails/send
-    Docs: https://developer.instantly.ai/emails/send-email
-    """
-    try:
-        import requests
-    except ImportError:
-        log.error("requests package required — run: pip install requests")
-        return False
-
-    headers = {
-        "Authorization": f"Bearer {_INSTANTLY_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "to": to_email,
-        "subject": subject,
-        "body": html_body or body,
-        "plain_body": body,
-        "reply_to": REPLY_TO,
-    }
-    if _INSTANTLY_FROM_EMAIL:
-        payload["from_email"] = _INSTANTLY_FROM_EMAIL
-
-    try:
-        resp = requests.post(
-            "https://api.instantly.ai/api/v2/emails/send",
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-        if resp.status_code in (200, 201):
-            data = resp.json() if resp.text else {}
-            log.info(
-                "Instantly direct send to %s (lead #%d) — id: %s",
-                to_email, lead_id, data.get("id", "?"),
-            )
-            log_outreach(lead_id, "email", subject, body, sender_email="instantly")
-            update_lead_status(lead_id, "emailed")
-            return True
-
-        log.warning(
-            "Instantly direct send failed (%d): %s",
-            resp.status_code, resp.text[:300],
-        )
-    except Exception as e:
-        log.error("Instantly direct send error: %s", e)
-
-    log.info("Falling back to SMTP for lead #%d", lead_id)
-    return _send_via_smtp_rotation(lead_id, to_email, subject, body, html_body)
-
-
-# ── SMTP multi-account fallback ───────────────────────────────────────────────
-# Used when INSTANTLY_API_KEY is not set. Implements:
-#   • Account rotation via SENDER_ACCOUNTS JSON (see .env.example)
-#   • Warmup-aware daily caps (src.outreach.warmup)
-#   • Business hours gate + domain cooldown (src.outreach.deliverability)
-#   • DB queue when all accounts are at daily cap
+# ── SMTP multi-account rotation ───────────────────────────────────────────────
+# Account rotation via SENDER_ACCOUNTS JSON (see .env.example).
+# Warmup-aware daily caps (src.outreach.warmup).
+# Business hours gate + domain cooldown (src.outreach.deliverability).
+# DB queue when all accounts are at daily cap.
 
 def _get_sender_accounts() -> list[dict]:
     raw = os.getenv("SENDER_ACCOUNTS", "").strip()

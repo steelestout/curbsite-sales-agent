@@ -144,14 +144,11 @@ SCORE_VOICE_THRESHOLD: int = int(os.getenv("SCORE_VOICE_THRESHOLD", "70"))
 RESEND_API_KEY: str = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL: str = os.getenv("RESEND_FROM_EMAIL", f"{FROM_NAME} <{FROM_EMAIL}>")
 
-# ── Instantly.ai (cold outreach) ──────────────────────────────────────────────
-# Used for: initial cold emails and follow-up sequences to prospects
-# Sign up: https://instantly.ai  |  ~$37/mo Hypergrowth
-# INSTANTLY_CAMPAIGN_ID: add lead to a campaign (recommended for sequences)
-# Leave blank to use direct-send mode (one-off API sends)
-INSTANTLY_API_KEY: str = os.getenv("INSTANTLY_API_KEY", "")
-INSTANTLY_CAMPAIGN_ID: str = os.getenv("INSTANTLY_CAMPAIGN_ID", "")
-INSTANTLY_FROM_EMAIL: str = os.getenv("INSTANTLY_FROM_EMAIL", FROM_EMAIL)
+# ── Cold outreach domain (separate from main curbsite.co) ─────────────────────
+# Register a dedicated outreach domain (e.g. getcurbsite.co) so that any spam
+# complaints never touch the main brand domain. See docs/EMAIL_SETUP.md.
+OUTREACH_DOMAIN: str = os.getenv("OUTREACH_DOMAIN", "")
+OUTREACH_EMAIL: str = os.getenv("OUTREACH_EMAIL", FROM_EMAIL)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

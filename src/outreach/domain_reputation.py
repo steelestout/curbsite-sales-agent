@@ -7,10 +7,10 @@ campaign send. Logs clear warnings with remediation steps if records are missing
 See docs/EMAIL_SETUP.md for full setup instructions.
 
 Usage:
-    python -m src.outreach.domain_reputation mail.curbsite.co
+    python -m src.outreach.domain_reputation getcurbsite.co
     # or from code:
     from src.outreach.domain_reputation import warn_if_misconfigured
-    ok = warn_if_misconfigured("mail.curbsite.co")
+    ok = warn_if_misconfigured("getcurbsite.co")
 """
 
 import logging
@@ -166,8 +166,11 @@ if __name__ == "__main__":
     selector_arg = sys.argv[2] if len(sys.argv) > 2 else "google"
 
     if not domain_arg:
+        import os
+        domain_arg = os.getenv("OUTREACH_DOMAIN") or os.getenv("SENDING_DOMAIN", "")
+    if not domain_arg:
         print("Usage: python -m src.outreach.domain_reputation <domain> [dkim_selector]")
-        print("Example: python -m src.outreach.domain_reputation mail.curbsite.co google")
+        print("Example: python -m src.outreach.domain_reputation getcurbsite.co google")
         sys.exit(1)
 
     result = check_domain(domain_arg, selector_arg)
