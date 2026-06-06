@@ -3,10 +3,16 @@ SQLite-based CRM — single source of truth for all leads.
 
 Tables
 ──────
-leads           — one row per business
-outreach_log    — every email / call attempt
-followup_queue  — scheduled follow-ups
-cost_log        — per-operation AI cost tracking
+leads            — one row per business
+outreach_log     — every email / call attempt
+followup_queue   — scheduled follow-ups
+cost_log         — per-operation AI cost tracking
+mockups          — generated mockup files
+builds           — production site builds
+domains          — registered domains
+vps_instances    — client VPS servers (Track A)
+approval_tokens  — Steele approve/reject tokens for built sites
+pagespeed_cache  — Google PageSpeed API response cache (7-day TTL)
 """
 
 import sqlite3
@@ -128,11 +134,32 @@ CREATE TABLE IF NOT EXISTS vps_instances (
     created_at          TEXT DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_leads_status   ON leads(status);
-CREATE INDEX IF NOT EXISTS idx_leads_score    ON leads(score DESC);
-CREATE INDEX IF NOT EXISTS idx_leads_email    ON leads(email);
-CREATE INDEX IF NOT EXISTS idx_leads_review   ON leads(review_needed);
-CREATE INDEX IF NOT EXISTS idx_followup_sched ON followup_queue(scheduled_for, sent);
+CREATE TABLE IF NOT EXISTS approval_tokens (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id     INTEGER NOT NULL REFERENCES leads(id),
+    token       TEXT NOT NULL UNIQUE,
+    action      TEXT NOT NULL,    -- 'approve' | 'reject'
+    used        INTEGER DEFAULT 0,
+    created_at  TEXT DEFAULT (datetime('now')),
+    expires_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pagespeed_cache (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    url           TEXT NOT NULL UNIQUE,
+    mobile_score  INTEGER,
+    desktop_score INTEGER,
+    cached_at     TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_leads_status      ON leads(status);
+CREATE INDEX IF NOT EXISTS idx_leads_score       ON leads(score DESC);
+CREATE INDEX IF NOT EXISTS idx_leads_email       ON leads(email);
+CREATE INDEX IF NOT EXISTS idx_leads_review      ON leads(review_needed);
+CREATE INDEX IF NOT EXISTS idx_leads_golive      ON leads(golive_at);
+CREATE INDEX IF NOT EXISTS idx_followup_sched    ON followup_queue(scheduled_for, sent);
+CREATE INDEX IF NOT EXISTS idx_approval_token    ON approval_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_pagespeed_url     ON pagespeed_cache(url);
 """
 
 
@@ -154,10 +181,39 @@ def get_conn(db_path: Path = DB_PATH):
         conn.close()
 
 
+# New columns added to the leads table after initial schema was created.
+# SQLite doesn't support IF NOT EXISTS on ALTER TABLE — we catch the OperationalError.
+_LEAD_MIGRATIONS: list[tuple[str, str]] = [
+    ("pagespeed_mobile",     "INTEGER"),
+    ("pagespeed_cached_at",  "TEXT"),
+    ("golive_at",            "TEXT"),
+    ("review_requested_at",  "TEXT"),
+    ("review_reminder_sent", "TEXT"),
+    ("review_received",      "INTEGER DEFAULT 0"),
+    ("referral_link",        "TEXT"),
+    ("referrals_sent",       "INTEGER DEFAULT 0"),
+    ("referrals_converted",  "INTEGER DEFAULT 0"),
+    ("build_approved",       "INTEGER DEFAULT 0"),
+    ("revision_needed",      "INTEGER DEFAULT 0"),
+    ("stripe_deposit_id",    "TEXT"),
+    ("stripe_final_id",      "TEXT"),
+    ("stripe_payment_url",   "TEXT"),
+]
+
+
+def _migrate_leads(conn: sqlite3.Connection) -> None:
+    for col, col_def in _LEAD_MIGRATIONS:
+        try:
+            conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+
 def init_db(db_path: Path = DB_PATH) -> None:
-    """Create tables if they don't exist."""
+    """Create tables and run column migrations."""
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate_leads(conn)
     log.info("Database ready: %s", db_path)
 
 

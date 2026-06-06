@@ -32,6 +32,13 @@ phonenumbers>=8.13.0
 # VPS deployment
 paramiko>=3.4.0          # SSH/SFTP to Hostinger VPS
 
+# Payments
+stripe>=9.0.0            # Stripe webhook handler
+
+# Web server (dashboard + webhook)
+flask>=3.0.0
+gunicorn>=22.0.0         # production WSGI server (Linux/VPS only)
+
 # Testing
 pytest>=8.2.0
 pytest-mock>=3.14.0

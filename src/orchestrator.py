@@ -11,17 +11,22 @@ new → scored → mockup_ready → emailed → followed_up → mockup_sent
 Stages
 ──────
 1. prospect       Scrape new leads (Yelp / Google Maps)
-2. score          AI-assisted lead scoring (0–100)
+2. score          AI-assisted lead scoring + PageSpeed bonus (0–100)
 2b. mockup        Pre-outreach: generate mockup immediately after scoring
-                  The mockup URL is embedded in the first cold email as the hook
 3. outreach       Send personalised cold emails with mockup link + Calendly CTA
 4. followup       Automated Day-3 and Day-7 follow-up sequence
 5. dossier        Generate pre-call brief for every booked appointment
-6. close          Monitor inbox for replies; classify + route (positive/negative/question)
+6. close          Monitor inbox for replies; classify + route
 7. build          Full production site build from intake form + client assets
+                  → emails Steele a preview with Approve / Request Changes buttons
 8. domain         Purchase domain via Namecheap
-9. deploy         Deploy site — Track A (dedicated Hetzner VPS) or Track B (zip handoff)
+9. deploy         Deploy site — Track A (Hetzner VPS) or Track B (zip handoff)
 10. golive        Poll for liveness; send client go-live notification
+
+Post-launch automation (run daily via scheduler)
+─────────────────────────────────────────────────
+  reviews         14-day review request + 30-day reminder
+  referrals       30-day referral drip email
 
 Deployment tracks
 ─────────────────
@@ -31,30 +36,33 @@ Track A — Client signed up for maintenance plan:
 Track B — No maintenance plan (client hosts their own):
   Build zip → email to client with README and hosting instructions
 
-The orchestrator auto-selects based on lead.care_plan:
-  care_plan IS NOT NULL → Track A
-  care_plan IS NULL     → Track B
+Gates (Steele's approvals)
+──────────────────────────
+GATE 1: Build trigger — runs: python -m src.orchestrator --step build --lead-id {id}
+        (or auto-triggered by Stripe 50% deposit webhook)
 
-Gates (Steele's manual approvals)
-──────────────────────────────────
-GATE 1: Before build starts — Steele reviews agreed_pending lead, confirms intake form,
-        then runs: python -m src.orchestrator --step build --lead-id {id}
+GATE 2: Preview approval — Steele clicks "Approve" in email or dashboard
+        → client receives preview + payment link
+        (or manually: python -m src.orchestrator --step approve-build --lead-id {id})
 
-GATE 2: Before go-live — Steele does visual QA of built site, then runs:
-        python -m src.orchestrator --step deploy --lead-id {id}
+GATE 3: Deploy — runs: python -m src.orchestrator --step deploy --lead-id {id}
+        (or auto-triggered by Stripe final payment webhook)
 
 Run via
 ───────
-  python -m src.orchestrator                     # full top-of-funnel (steps 1–6)
-  python -m src.orchestrator --dry-run           # no emails, no deploys
-  python -m src.orchestrator --step close        # check inbox for replies
-  python -m src.orchestrator --step mockup       # generate mockups for scored leads
-  python -m src.orchestrator --step build        --lead-id {id}   # GATE 1
-  python -m src.orchestrator --step domain       --lead-id {id}   # purchase domain
+  python -m src.orchestrator                         # full top-of-funnel (steps 1–6)
+  python -m src.orchestrator --dry-run               # no emails, no deploys
+  python -m src.orchestrator --step close            # check inbox for replies
+  python -m src.orchestrator --step mockup           # generate mockups for scored leads
+  python -m src.orchestrator --step build --lead-id {id}          # GATE 1
+  python -m src.orchestrator --step approve-build --lead-id {id}  # GATE 2 (manual bypass)
+  python -m src.orchestrator --step domain    --lead-id {id}      # purchase domain
   python -m src.orchestrator --step vps-provision --lead-id {id}  # Track A: provision VPS
-  python -m src.orchestrator --step deploy       --lead-id {id}   # GATE 2: deploy site
-  python -m src.orchestrator --step handoff      --lead-id {id}   # Track B: zip handoff
-  python -m src.orchestrator --step golive       --lead-id {id}   # wait for live + notify
+  python -m src.orchestrator --step deploy    --lead-id {id}      # GATE 3: deploy site
+  python -m src.orchestrator --step handoff   --lead-id {id}      # Track B: zip handoff
+  python -m src.orchestrator --step golive    --lead-id {id}      # wait for live + notify
+  python -m src.orchestrator --step reviews                        # process review requests
+  python -m src.orchestrator --step referrals                      # process referral drip
 """
 
 import argparse
@@ -233,7 +241,7 @@ def step_close(dry_run: bool = False) -> None:
 def step_build(lead_id: int, intake: dict = None, dry_run: bool = False) -> None:
     """
     GATE 1 — Build the full production site for a specific lead.
-    Requires lead status = 'agreed' (Steele has confirmed the close).
+    After build completes, emails Steele a preview with Approve/Request Changes buttons.
     """
     log.info("═══ STEP 8: SITE BUILD (lead #%d) ═══", lead_id)
 
@@ -242,7 +250,7 @@ def step_build(lead_id: int, intake: dict = None, dry_run: bool = False) -> None
         log.error("Lead #%d not found.", lead_id)
         return
 
-    allowed_statuses = ("agreed", "agreed_pending", "build_ready")
+    allowed_statuses = ("agreed", "agreed_pending", "build_ready", "building")
     if lead["status"] not in allowed_statuses:
         log.warning(
             "Lead #%d has status '%s' — expected one of %s. Proceeding anyway.",
@@ -255,7 +263,51 @@ def step_build(lead_id: int, intake: dict = None, dry_run: bool = False) -> None
 
     from src.build.site_builder import build_site
     build_dir = build_site(lead, intake=intake)
-    log.info("Done — site built at %s", build_dir)
+    log.info("Site built at %s", build_dir)
+
+    # Email Steele a preview with approve / request-changes buttons (GATE 2)
+    try:
+        from src.notifications.client_status import request_steele_approval
+        request_steele_approval(lead_id)
+        log.info("Steele approval email sent for lead #%d — check your inbox.", lead_id)
+    except Exception as exc:
+        log.error("Could not send Steele approval email: %s", exc)
+
+    log.info("Done — lead #%d awaiting Steele approval before client sees preview.", lead_id)
+
+
+def step_approve_build(lead_id: int, dry_run: bool = False) -> None:
+    """
+    GATE 2 (manual CLI bypass) — Approve a built site and send client the review email.
+    Normally triggered by Steele clicking the approval link in his email or the dashboard.
+    """
+    log.info("═══ APPROVE BUILD (lead #%d) ═══", lead_id)
+
+    if dry_run:
+        log.info("[DRY RUN] Would approve build for lead #%d", lead_id)
+        return
+
+    from src.crm.database import get_conn
+    from src.notifications.client_status import notify_review_ready
+    from src.config import DASHBOARD_URL, PORTAL_URL
+    import datetime
+
+    lead = get_lead(lead_id)
+    if not lead:
+        log.error("Lead #%d not found.", lead_id)
+        return
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE leads SET build_approved=1, updated_at=? WHERE id=?",
+            (datetime.datetime.utcnow().isoformat(), lead_id),
+        )
+    update_lead_status(lead_id, "build_ready", notes="Approved by Steele (CLI)")
+
+    preview_url = f"{DASHBOARD_URL}/preview/{lead_id}/"
+    payment_url = lead.get("stripe_payment_url") or f"{PORTAL_URL}/pay/{lead_id}"
+    notify_review_ready(lead, preview_url, payment_url)
+    log.info("Done — review-ready email sent to client for lead #%d", lead_id)
 
 
 def step_domain(lead_id: int, preferred_domain: str = None, dry_run: bool = False) -> None:
@@ -402,9 +454,42 @@ def step_golive(lead_id: int, dry_run: bool = False) -> None:
     from src.config import PORTAL_URL
     success = run_golive(lead, domain, portal_url=PORTAL_URL, dry_run=dry_run)
     if success:
+        # Stamp golive_at so review/referral timers start
+        import datetime
+        from src.crm.database import get_conn
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE leads SET golive_at=?, updated_at=? WHERE id=?",
+                (datetime.datetime.utcnow().isoformat(), datetime.datetime.utcnow().isoformat(), lead_id),
+            )
+        # Send site-live email to client
+        if not dry_run:
+            try:
+                lead_fresh = get_lead(lead_id)
+                from src.notifications.client_status import notify_site_live
+                notify_site_live(lead_fresh, f"https://{domain}")
+            except Exception as exc:
+                log.error("Could not send site-live email: %s", exc)
         log.info("Done — lead #%d is LIVE at https://%s", lead_id, domain)
     else:
         log.warning("Go-live check failed for lead #%d — check manually.", lead_id)
+
+
+def step_reviews(dry_run: bool = False) -> None:
+    """Process 14-day review requests and 30-day reminders for live clients."""
+    log.info("═══ REVIEW REQUESTS ═══")
+    from src.reviews.request import process_review_requests
+    stats = process_review_requests(dry_run=dry_run)
+    log.info("Done — requests: %d | reminders: %d | errors: %d",
+             stats["requests_sent"], stats["reminders_sent"], stats["errors"])
+
+
+def step_referrals(dry_run: bool = False) -> None:
+    """Process 30-day referral drip emails for live clients."""
+    log.info("═══ REFERRAL DRIP ═══")
+    from src.referrals.drip import process_referral_drip
+    stats = process_referral_drip(dry_run=dry_run)
+    log.info("Done — sent: %d | errors: %d", stats["sent"], stats["errors"])
 
 
 def step_report(days: int = 7) -> None:
@@ -454,7 +539,8 @@ def main() -> None:
         choices=[
             "prospect", "score", "outreach", "followup",
             "dossiers", "mockup", "close",
-            "build", "domain", "vps-provision", "deploy", "handoff", "golive",
+            "build", "approve-build", "domain", "vps-provision", "deploy", "handoff", "golive",
+            "reviews", "referrals",
             "report", "all",
         ],
         default="all",
@@ -497,7 +583,10 @@ def main() -> None:
     init_db()
 
     # Single-lead dossier shortcut (legacy)
-    _lead_required_steps = ("build", "domain", "vps-provision", "deploy", "handoff", "golive", "dossiers")
+    _lead_required_steps = (
+        "build", "approve-build", "domain", "vps-provision",
+        "deploy", "handoff", "golive", "dossiers",
+    )
     if args.lead_id and args.step not in _lead_required_steps:
         from src.crm.dossier import generate_dossier
         dossier = generate_dossier(args.lead_id)
@@ -527,6 +616,10 @@ def main() -> None:
             if not args.lead_id:
                 parser.error("--step build requires --lead-id")
             step_build(args.lead_id, dry_run=args.dry_run)
+        case "approve-build":
+            if not args.lead_id:
+                parser.error("--step approve-build requires --lead-id")
+            step_approve_build(args.lead_id, dry_run=args.dry_run)
         case "domain":
             if not args.lead_id:
                 parser.error("--step domain requires --lead-id")
@@ -547,6 +640,10 @@ def main() -> None:
             if not args.lead_id:
                 parser.error("--step golive requires --lead-id")
             step_golive(args.lead_id, dry_run=args.dry_run)
+        case "reviews":
+            step_reviews(dry_run=args.dry_run)
+        case "referrals":
+            step_referrals(dry_run=args.dry_run)
         case "report":
             step_report(days=args.days)
         case "all":

@@ -120,7 +120,18 @@ def score_lead(lead: dict, use_ai: bool = True) -> int:
         if ai_reason:
             reasons.append(f"AI insight: {ai_reason}")
 
-    final = min(100, base + ai_bonus)
+    # PageSpeed bonus — only for leads with an existing website
+    ps_bonus, ps_reason = 0, ""
+    if lead.get("has_website") and lead.get("website"):
+        try:
+            from src.prospecting.qualifier import score_bonus_pagespeed
+            ps_bonus, ps_reason = score_bonus_pagespeed(lead)
+            if ps_reason:
+                reasons.append(ps_reason)
+        except Exception as exc:
+            log.debug("PageSpeed bonus skipped: %s", exc)
+
+    final = min(100, base + ai_bonus + ps_bonus)
 
     upsert_lead({
         "business_name": lead["business_name"],

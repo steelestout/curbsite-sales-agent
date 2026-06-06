@@ -115,5 +115,28 @@ CURBSITE_OWNER_EMAIL: str = os.getenv("CURBSITE_OWNER_EMAIL", "steele.stout@gmai
 CURBSITE_OWNER_PASSWORD: str = os.getenv("CURBSITE_OWNER_PASSWORD", "")
 CURBSITE_CRM_API_KEY: str = os.getenv("CURBSITE_CRM_API_KEY", "")
 
+# ── Stripe payments ───────────────────────────────────────────────────────────
+STRIPE_SECRET_KEY: str = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_WEBHOOK_PORT: int = int(os.getenv("STRIPE_WEBHOOK_PORT", "5001"))
+
+# ── Google PageSpeed Insights ─────────────────────────────────────────────────
+GOOGLE_PAGESPEED_API_KEY: str = os.getenv("GOOGLE_PAGESPEED_API_KEY", "")
+
+# ── Google Reviews ────────────────────────────────────────────────────────────
+# Direct "Write a review" link for the Curbsite Google Business Profile
+# Find it: Google Maps → your profile → "Get more reviews" → copy link
+GOOGLE_REVIEW_URL: str = os.getenv("GOOGLE_REVIEW_URL", "")
+
+# ── Owner dashboard ───────────────────────────────────────────────────────────
+DASHBOARD_URL: str = os.getenv("DASHBOARD_URL", "http://localhost:5050")
+DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "5050"))
+
+# ── Steele's personal notification email ──────────────────────────────────────
+STEELE_EMAIL: str = os.getenv("STEELE_EMAIL", "steele.stout@gmail.com")
+
+# ── Voice scoring threshold (flags high-value leads for Rook outreach) ────────
+SCORE_VOICE_THRESHOLD: int = int(os.getenv("SCORE_VOICE_THRESHOLD", "70"))
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
