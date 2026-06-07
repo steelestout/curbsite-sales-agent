@@ -397,9 +397,6 @@ def assert_assets_ready(lead: dict, min_photos: int = 3) -> bool:
 
 # ── Account creation & status/invoice sync ────────────────────────────────────
 
-_DEPOSIT_TITLE = "Deposit (50%)"
-_FINAL_TITLE   = "Final payment (50%)"
-
 _PORTAL_STATUS_MAP: dict[str, str] = {
     "building":    "In Progress",
     "build_ready": "Awaiting Approval",
@@ -723,31 +720,25 @@ def sync_invoice_to_portal(
                 session, inv["id"], lead, payment_amount, processor, is_final
             )
 
-    # Title-based match: portal creates invoices titled "{name} — Deposit (50%)"
-    # and "{name} — Final payment (50%)" — match on the label substring.
-    label = _FINAL_TITLE if is_final else _DEPOSIT_TITLE
-    candidates = [
-        inv for inv in all_invoices
-        if label in (inv.get("title") or "")
-        and (inv.get("status") or "").lower() == "unpaid"
-    ]
+    # Positional match: use Unpaid invoice order (deposit first, then final)
+    unpaid = [inv for inv in all_invoices if (inv.get("status") or "").lower() == "unpaid"]
 
-    if not candidates:
+    if not unpaid:
         log.warning(
-            "sync_invoice_to_portal: no Unpaid invoices matching '%s' for lead #%d (client %s)",
-            label, lead.get("id", 0), portal_client_id,
+            "sync_invoice_to_portal: no Unpaid invoices found for lead #%d (client %s)",
+            lead.get("id", 0), portal_client_id,
         )
         return False
 
     if not is_final:
-        # Deposit: mark only the first matching Unpaid invoice
+        # Deposit: mark only the first Unpaid invoice
         return _patch_invoice_paid(
-            session, candidates[0]["id"], lead, payment_amount, processor, is_final
+            session, unpaid[0]["id"], lead, payment_amount, processor, is_final
         )
 
-    # Final: mark all matching Unpaid invoices
+    # Final: mark all remaining Unpaid invoices
     success = True
-    for inv in candidates:
+    for inv in unpaid:
         if not _patch_invoice_paid(
             session, inv["id"], lead, payment_amount, processor, is_final
         ):
