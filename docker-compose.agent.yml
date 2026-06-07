@@ -27,6 +27,8 @@ services:
       - "traefik.http.routers.webhook.tls.certresolver=letsencrypt"
       - "traefik.http.services.webhook.loadbalancer.server.port=5001"
 
+  # Dashboard also serves /unsubscribe, /preview/, /approve/, /reject/ endpoints.
+  # Port 5050 matches the DASHBOARD_PORT env var and app.run() default.
   curbsite-dashboard:
     build: .
     container_name: curbsite-dashboard
@@ -38,24 +40,10 @@ services:
       - ./data:/app/data
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.dashboard.rule=Host(`curbsite.co`) && PathPrefix(`/crm/analytics`)"
+      - "traefik.http.routers.dashboard.rule=Host(`curbsite.co`) && (PathPrefix(`/crm/analytics`) || PathPrefix(`/preview/`) || PathPrefix(`/approve/`) || PathPrefix(`/reject/`) || PathPrefix(`/unsubscribe`) || PathPrefix(`/api/stats`))"
       - "traefik.http.routers.dashboard.entrypoints=websecure"
       - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
-      - "traefik.http.services.dashboard.loadbalancer.server.port=5002"
-
-  curbsite-unsubscribe:
-    build: .
-    container_name: curbsite-unsubscribe
-    restart: unless-stopped
-    command: python -m src.outreach.unsubscribe
-    env_file: .env
-    network_mode: host
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.unsub.rule=Host(`curbsite.co`) && PathPrefix(`/unsubscribe`)"
-      - "traefik.http.routers.unsub.entrypoints=websecure"
-      - "traefik.http.routers.unsub.tls.certresolver=letsencrypt"
-      - "traefik.http.services.unsub.loadbalancer.server.port=5003"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=5050"
 
   # nginx serves preview mockups on port 8081 (host network, avoids conflict with
   # Traefik which already owns port 80/443 on the host).
