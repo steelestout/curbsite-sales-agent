@@ -17,10 +17,13 @@ MODEL_DEFAULT: str = "gpt-4o-mini"      # cheap, fast — used everywhere
 MODEL_QUALITY: str = "gpt-4o"           # used only for final email drafts
 
 # ── Email (SMTP) ─────────────────────────────────────────────────────────────
-SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER: str = os.environ["SMTP_USER"]
-SMTP_PASS: str = os.environ["SMTP_PASS"]
+# SMTP_USER / SMTP_PASS are the primary inbox credentials (also used for IMAP reply
+# monitoring). They fall back to OUTREACH_SMTP_* so a single outreach account
+# config is sufficient if you're not running a separate transactional inbox.
+SMTP_HOST: str = os.getenv("SMTP_HOST") or os.getenv("OUTREACH_SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT: int = int(os.getenv("SMTP_PORT") or os.getenv("OUTREACH_SMTP_PORT", "587"))
+SMTP_USER: str = os.getenv("SMTP_USER") or os.getenv("OUTREACH_SMTP_USER", "")
+SMTP_PASS: str = os.getenv("SMTP_PASS") or os.getenv("OUTREACH_SMTP_PASS", "")
 FROM_NAME: str = os.getenv("FROM_NAME", "Steele @ Curbsite")
 FROM_EMAIL: str = os.getenv("FROM_EMAIL", SMTP_USER)
 REPLY_TO: str = os.getenv("REPLY_TO", FROM_EMAIL)
