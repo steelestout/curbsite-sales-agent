@@ -1,0 +1,77 @@
+version: '3.8'
+services:
+  curbsite-agent:
+    build: .
+    container_name: curbsite-agent
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - traefik-net
+
+  curbsite-webhook:
+    build: .
+    container_name: curbsite-webhook
+    restart: unless-stopped
+    command: python -m src.payments.stripe_webhook
+    env_file: .env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.webhook.rule=Host(`curbsite.co`) && PathPrefix(`/webhook`)"
+      - "traefik.http.routers.webhook.entrypoints=websecure"
+      - "traefik.http.routers.webhook.tls.certresolver=letsencrypt"
+      - "traefik.http.services.webhook.loadbalancer.server.port=5001"
+    networks:
+      - traefik-net
+
+  curbsite-dashboard:
+    build: .
+    container_name: curbsite-dashboard
+    restart: unless-stopped
+    command: python -m src.dashboard.app
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`curbsite.co`) && PathPrefix(`/crm/analytics`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=5002"
+    networks:
+      - traefik-net
+
+  curbsite-unsubscribe:
+    build: .
+    container_name: curbsite-unsubscribe
+    restart: unless-stopped
+    command: python -m src.outreach.unsubscribe
+    env_file: .env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.unsub.rule=Host(`curbsite.co`) && PathPrefix(`/unsubscribe`)"
+      - "traefik.http.routers.unsub.entrypoints=websecure"
+      - "traefik.http.routers.unsub.tls.certresolver=letsencrypt"
+      - "traefik.http.services.unsub.loadbalancer.server.port=5003"
+    networks:
+      - traefik-net
+
+  curbsite-previews:
+    image: nginx:alpine
+    container_name: curbsite-previews
+    restart: unless-stopped
+    volumes:
+      - /public_html/previews:/usr/share/nginx/html:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.previews.rule=Host(`preview.curbsite.co`)"
+      - "traefik.http.routers.previews.entrypoints=websecure"
+      - "traefik.http.routers.previews.tls.certresolver=letsencrypt"
+      - "traefik.http.services.previews.loadbalancer.server.port=80"
+    networks:
+      - traefik-net
+
+networks:
+  traefik-net:
+    external: true
