@@ -972,6 +972,8 @@ function sortTable(id, col) {
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
+@app.route("/crm/analytics")
+@app.route("/crm/analytics/")
 def index():
     stats = _stats()
     return render_template_string(

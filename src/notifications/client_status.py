@@ -351,6 +351,140 @@ def notify_site_live(lead: dict, site_url: str) -> None:
         log.error("Failed to send site-live email: %s", exc)
 
 
+# ── Portal welcome email ──────────────────────────────────────────────────────
+
+def notify_client_portal_created(lead: dict) -> None:
+    """
+    Create the client's portal account (via owner API) then email them their
+    login credentials along with the mockup preview link and an asset-upload CTA.
+
+    Called when a lead reaches status=agreed (50% deposit received).
+    """
+    email = lead.get("email")
+    if not email:
+        return
+
+    name = lead.get("owner_name") or lead.get("business_name", "there")
+    first = name.split()[0]
+    biz = lead.get("business_name", "your business")
+
+    from src.build.portal_sync import create_portal_account
+    temp_password = create_portal_account(lead)
+
+    # Pull the mockup URL from the DB if one was generated pre-outreach
+    from src.crm.database import get_conn as _get_conn
+    with _get_conn() as _conn:
+        _row = _conn.execute(
+            "SELECT netlify_url FROM mockups WHERE lead_id=?", (lead["id"],)
+        ).fetchone()
+    mockup_url: str | None = _row["netlify_url"] if _row else None
+
+    # TODO: confirm exact portal login + upload paths with Steele
+    login_url  = f"{PORTAL_URL}/login"
+    upload_url = f"{PORTAL_URL}/upload"
+
+    is_new_account = bool(temp_password and temp_password != "__existing__")
+
+    if is_new_account:
+        creds_block = f"""
+        <div style="background:#f0f7f0;border-left:4px solid #2e7d32;padding:18px 20px;
+                    border-radius:0 8px 8px 0;margin:20px 0;">
+          <p style="font-size:15px;color:#1b3a1b;font-weight:bold;margin:0 0 10px;">
+            Your Client Portal Login
+          </p>
+          <p style="font-size:14px;color:#333;margin:0 0 6px;">
+            <strong>URL:</strong>&nbsp;
+            <a href="{login_url}" style="color:#2e7d32;">{login_url}</a>
+          </p>
+          <p style="font-size:14px;color:#333;margin:0 0 6px;">
+            <strong>Email:</strong> {email}
+          </p>
+          <p style="font-size:14px;color:#333;margin:0 0 6px;">
+            <strong>Temp password:</strong>&nbsp;
+            <code style="background:#e8f5e9;padding:2px 7px;border-radius:4px;">{temp_password}</code>
+          </p>
+          <p style="font-size:12px;color:#777;margin:8px 0 0;">
+            Please change your password after first login.
+          </p>
+        </div>"""
+        creds_text = (
+            f"Your portal login:\nURL: {login_url}\n"
+            f"Email: {email}\nPassword: {temp_password}\n\n"
+        )
+    else:
+        creds_block = f"""
+        <div style="background:#f0f7f0;border-left:4px solid #2e7d32;padding:18px 20px;
+                    border-radius:0 8px 8px 0;margin:20px 0;">
+          <p style="font-size:15px;color:#1b3a1b;font-weight:bold;margin:0 0 8px;">
+            Your Client Portal
+          </p>
+          <p style="font-size:14px;color:#333;margin:0;">
+            Log in at <a href="{login_url}" style="color:#2e7d32;">{login_url}</a>
+            using your existing account.
+          </p>
+        </div>"""
+        creds_text = f"Your portal: {login_url}\n\n"
+
+    mockup_block = ""
+    mockup_text  = ""
+    if mockup_url:
+        mockup_block = (
+            _p("Here's the mockup we built — the finished site will look even better:")
+            + _btn(mockup_url, "View Your Mockup Preview →")
+        )
+        mockup_text = f"Mockup preview: {mockup_url}\n\n"
+
+    subject = f"Your Curbsite portal is ready — {biz}"
+    inner = (
+        _p(f"Hey {first},", size=17, color="#1a1a1a")
+        + _p(
+            f"We received your deposit — thank you! Your site for <strong>{biz}</strong> "
+            "is now in the build queue."
+        )
+        + _p(
+            "We've set up your client portal where you can track progress, "
+            "upload photos and your logo, and see your site come together."
+        )
+        + creds_block
+        + _p(
+            "<strong>Next step:</strong> Log in and upload your assets — "
+            "photos, logo, menu, or any content you'd like on the site. "
+            "The more you give us, the better the result."
+        )
+        + _btn(upload_url, "Upload Your Photos & Logo →")
+        + mockup_block
+        + f"""<div style="background:#f9f9f9;padding:16px 20px;border-radius:8px;margin:20px 0;">
+          <p style="font-size:14px;color:#555;margin:0 0 6px;font-weight:bold;">
+            Project status: Your site is being built
+          </p>
+          <p style="font-size:13px;color:#777;margin:0;">
+            We'll send you a preview link and the final payment request
+            in 3–5 business days.
+          </p>
+        </div>"""
+        + _p("Questions? Just reply to this email — I'm always here.")
+        + _p(f"Let's build something great,<br><strong>Steele @ Curbsite</strong>")
+    )
+
+    text = (
+        f"Hey {first},\n\n"
+        f"We received your deposit — your site build has started!\n\n"
+        + creds_text
+        + f"Upload your photos and logo: {upload_url}\n\n"
+        + mockup_text
+        + "We'll send you a preview link in 3–5 business days.\n\nSteele @ Curbsite"
+    )
+
+    try:
+        _send_html_email(email, subject, _wrap(inner), text)
+        log.info(
+            "Portal-created email sent to %s (lead #%d) — new_account=%s",
+            email, lead["id"], is_new_account,
+        )
+    except Exception as exc:
+        log.error("Failed to send portal-created email to %s: %s", email, exc)
+
+
 # ── Steele approval gate ──────────────────────────────────────────────────────
 
 def request_steele_approval(lead_id: int) -> None:
@@ -371,6 +505,12 @@ def request_steele_approval(lead_id: int) -> None:
     preview_url = f"{DASHBOARD_URL}/preview/{lead_id}/"
 
     update_lead_status(lead_id, "build_ready", notes="Awaiting Steele approval")
+
+    try:
+        from src.build.portal_sync import sync_lead_status_to_portal
+        sync_lead_status_to_portal(get_lead(lead_id))
+    except Exception as _exc:
+        log.error("Portal status sync (build_ready) failed for lead #%d: %s", lead_id, _exc)
 
     biz = lead.get("business_name", f"Lead #{lead_id}")
     subject = f"[Curbsite] Review & approve site build — {biz}"

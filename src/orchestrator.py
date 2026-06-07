@@ -462,14 +462,20 @@ def step_golive(lead_id: int, dry_run: bool = False) -> None:
                 "UPDATE leads SET golive_at=?, updated_at=? WHERE id=?",
                 (datetime.datetime.utcnow().isoformat(), datetime.datetime.utcnow().isoformat(), lead_id),
             )
-        # Send site-live email to client
         if not dry_run:
+            lead_fresh = get_lead(lead_id)
+            # Send site-live email to client
             try:
-                lead_fresh = get_lead(lead_id)
                 from src.notifications.client_status import notify_site_live
                 notify_site_live(lead_fresh, f"https://{domain}")
             except Exception as exc:
                 log.error("Could not send site-live email: %s", exc)
+            # Sync live status to portal — "Your site is live! 🎉"
+            try:
+                from src.build.portal_sync import sync_lead_status_to_portal
+                sync_lead_status_to_portal(lead_fresh)
+            except Exception as exc:
+                log.error("Portal live status sync failed for lead #%d: %s", lead_id, exc)
         log.info("Done — lead #%d is LIVE at https://%s", lead_id, domain)
     else:
         log.warning("Go-live check failed for lead #%d — check manually.", lead_id)
