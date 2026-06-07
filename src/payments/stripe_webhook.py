@@ -1,19 +1,25 @@
 """
-Stripe webhook handler — Flask app for payment events.
+Payment webhook Flask app — handles both Stripe and Square on port 5001.
 
-Events handled:
-  payment_intent.succeeded
-    payment_type=deposit  → status 'agreed', trigger build, notify Steele
-    payment_type=final    → trigger deploy/golive
+Routes:
+  POST /webhook/stripe  — Stripe payment_intent.succeeded
+  POST /webhook         — backward-compat alias for /webhook/stripe
+  POST /webhook/square  — Square payment.completed
+
+Pipeline transitions (both processors):
+  50% deposit → status='agreed', auto-build starts
+  Final 50%   → status='deployed', go-live triggered
 
 Deploy on Hostinger VPS:
   gunicorn -w 2 -b 0.0.0.0:5001 'src.payments.stripe_webhook:app'
 
-Register at https://dashboard.stripe.com/webhooks:
-  Endpoint: https://curbsite.co/stripe/webhook
-  Events:   payment_intent.succeeded
+Stripe webhook registration:
+  URL: https://curbsite.co/webhook/stripe
+  Events: payment_intent.succeeded
 
-See docs/STRIPE_SETUP.md for full setup instructions.
+Square webhook registration:
+  URL: https://curbsite.co/webhook/square
+  Events: payment.completed
 """
 
 import logging
@@ -26,6 +32,7 @@ from flask import Flask, request, jsonify
 from src.config import (
     STRIPE_SECRET_KEY,
     STRIPE_WEBHOOK_SECRET,
+    SQUARE_WEBHOOK_SIGNATURE_KEY,
     STEELE_EMAIL,
     PORTAL_URL,
 )
@@ -35,6 +42,7 @@ from src.notifications.client_status import (
     notify_payment_confirmed,
     request_steele_approval,
 )
+from src.payments.square_webhook import verify_square_signature
 
 log = logging.getLogger(__name__)
 
@@ -43,10 +51,9 @@ stripe.api_key = STRIPE_SECRET_KEY
 app = Flask(__name__)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
-def _get_lead_by_pi(pi_id: str) -> dict | None:
-    """Find a lead that references this PaymentIntent ID."""
+def _get_lead_by_stripe_pi(pi_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM leads WHERE stripe_deposit_id=? OR stripe_final_id=?",
@@ -55,26 +62,42 @@ def _get_lead_by_pi(pi_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-def _set_stripe_pi(lead_id: int, field: str, pi_id: str) -> None:
-    """Store a Stripe PaymentIntent ID on the lead row."""
+def _record_payment_id(
+    lead_id: int,
+    payment_id: str,
+    processor: str,
+    is_deposit: bool,
+) -> None:
+    """Write the payment ID and processor into the lead row."""
+    now = datetime.utcnow().isoformat()
     with get_conn() as conn:
-        conn.execute(
-            f"UPDATE leads SET {field}=?, updated_at=? WHERE id=?",
-            (pi_id, datetime.utcnow().isoformat(), lead_id),
-        )
+        if processor == "stripe":
+            field = "stripe_deposit_id" if is_deposit else "stripe_final_id"
+            conn.execute(
+                f"UPDATE leads SET {field}=?, payment_processor=?, updated_at=? WHERE id=?",
+                (payment_id, processor, now, lead_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE leads SET square_payment_id=?, payment_processor=?, updated_at=? WHERE id=?",
+                (payment_id, processor, now, lead_id),
+            )
 
 
-# ── Payment handlers ──────────────────────────────────────────────────────────
+# ── Shared pipeline handlers ──────────────────────────────────────────────────
 
-def _handle_deposit(lead: dict, pi_id: str) -> None:
+def _handle_deposit(lead: dict, payment_id: str, processor: str = "stripe") -> None:
     """50% deposit confirmed — move to 'agreed', kick off build."""
     lead_id = lead["id"]
-    log.info("50%% deposit received — lead #%d (%s)", lead_id, lead.get("business_name"))
+    log.info(
+        "50%% deposit received — lead #%d (%s) via %s",
+        lead_id, lead.get("business_name"), processor,
+    )
 
-    _set_stripe_pi(lead_id, "stripe_deposit_id", pi_id)
+    _record_payment_id(lead_id, payment_id, processor, is_deposit=True)
     update_lead_status(
         lead_id, "agreed",
-        notes=f"50% deposit received via Stripe PI {pi_id}",
+        notes=f"50% deposit received via {processor.title()} {payment_id}",
     )
 
     notify_build_started(lead)
@@ -99,15 +122,18 @@ def _handle_deposit(lead: dict, pi_id: str) -> None:
     threading.Thread(target=_do_build, daemon=True).start()
 
 
-def _handle_final(lead: dict, pi_id: str) -> None:
-    """Final 50% confirmed — update status, send confirmation, trigger golive."""
+def _handle_final(lead: dict, payment_id: str, processor: str = "stripe") -> None:
+    """Final 50% confirmed — update status, send confirmation, trigger go-live."""
     lead_id = lead["id"]
-    log.info("Final payment received — lead #%d (%s)", lead_id, lead.get("business_name"))
+    log.info(
+        "Final payment received — lead #%d (%s) via %s",
+        lead_id, lead.get("business_name"), processor,
+    )
 
-    _set_stripe_pi(lead_id, "stripe_final_id", pi_id)
+    _record_payment_id(lead_id, payment_id, processor, is_deposit=False)
     update_lead_status(
         lead_id, "deployed",
-        notes=f"Final payment received via Stripe PI {pi_id}",
+        notes=f"Final payment received via {processor.title()} {payment_id}",
     )
 
     lead_fresh = get_lead(lead_id)
@@ -127,10 +153,9 @@ def _handle_final(lead: dict, pi_id: str) -> None:
     threading.Thread(target=_do_golive, daemon=True).start()
 
 
-# ── Webhook route ─────────────────────────────────────────────────────────────
+# ── Stripe webhook route ───────────────────────────────────────────────────────
 
-@app.route("/webhook", methods=["POST"])
-def stripe_webhook():
+def _stripe_handler():
     payload = request.get_data()
     sig = request.headers.get("Stripe-Signature", "")
 
@@ -140,7 +165,7 @@ def stripe_webhook():
         log.warning("Invalid Stripe webhook signature — rejecting")
         return jsonify({"error": "bad signature"}), 400
     except Exception as exc:
-        log.error("Webhook parse error: %s", exc)
+        log.error("Stripe webhook parse error: %s", exc)
         return jsonify({"error": str(exc)}), 400
 
     if event["type"] == "payment_intent.succeeded":
@@ -153,18 +178,85 @@ def stripe_webhook():
 
         lead = get_lead(int(lead_id_str)) if lead_id_str else None
         if not lead:
-            lead = _get_lead_by_pi(pi_id)
+            lead = _get_lead_by_stripe_pi(pi_id)
 
         if not lead:
             log.warning("PaymentIntent %s has no matching lead — ignoring", pi_id)
             return jsonify({"received": True}), 200
 
         if payment_type == "deposit" or lead.get("stripe_deposit_id") == pi_id:
-            _handle_deposit(lead, pi_id)
+            _handle_deposit(lead, pi_id, processor="stripe")
         elif payment_type == "final" or lead.get("stripe_final_id") == pi_id:
-            _handle_final(lead, pi_id)
+            _handle_final(lead, pi_id, processor="stripe")
         else:
-            log.info("Unclassified PI %s for lead #%d — no action", pi_id, lead["id"])
+            log.info("Unclassified Stripe PI %s for lead #%d — no action", pi_id, lead["id"])
+
+    return jsonify({"received": True}), 200
+
+
+@app.route("/webhook/stripe", methods=["POST"])
+def stripe_webhook():
+    return _stripe_handler()
+
+
+@app.route("/webhook", methods=["POST"])
+def stripe_webhook_legacy():
+    """Backward-compatible alias — keeps existing Stripe registration working."""
+    return _stripe_handler()
+
+
+# ── Square webhook route ───────────────────────────────────────────────────────
+
+@app.route("/webhook/square", methods=["POST"])
+def square_webhook():
+    payload = request.get_data()
+    sig = request.headers.get("x-square-hmacsha256-signature", "")
+
+    if not SQUARE_WEBHOOK_SIGNATURE_KEY:
+        log.error("SQUARE_WEBHOOK_SIGNATURE_KEY not configured — rejecting")
+        return jsonify({"error": "not configured"}), 500
+
+    if not verify_square_signature(payload, sig, SQUARE_WEBHOOK_SIGNATURE_KEY):
+        log.warning("Invalid Square webhook signature — rejecting")
+        return jsonify({"error": "bad signature"}), 400
+
+    try:
+        event = request.get_json(force=True)
+    except Exception as exc:
+        log.error("Square webhook JSON parse error: %s", exc)
+        return jsonify({"error": str(exc)}), 400
+
+    if event.get("type") == "payment.completed":
+        payment = event.get("data", {}).get("object", {}).get("payment", {})
+        sq_id = payment.get("id", "")
+        meta = payment.get("metadata", {})
+        amount_cents = payment.get("amount_money", {}).get("amount", 0)
+
+        lead_id_str = meta.get("lead_id")
+        payment_type = meta.get("payment_type", "")  # 'deposit' | 'final'
+
+        lead = get_lead(int(lead_id_str)) if lead_id_str else None
+
+        if not lead:
+            log.warning("Square payment %s has no matching lead — ignoring", sq_id)
+            return jsonify({"received": True}), 200
+
+        # Determine deposit vs final: prefer explicit metadata, fall back to
+        # whether we already have a square_payment_id (meaning deposit came first).
+        if not payment_type:
+            payment_type = "final" if lead.get("square_payment_id") else "deposit"
+
+        log.info(
+            "Square %s payment %s — %d cents — lead #%d",
+            payment_type, sq_id, amount_cents, lead["id"],
+        )
+
+        if payment_type == "deposit":
+            _handle_deposit(lead, sq_id, processor="square")
+        elif payment_type == "final":
+            _handle_final(lead, sq_id, processor="square")
+        else:
+            log.info("Unclassified Square payment %s for lead #%d — no action", sq_id, lead["id"])
 
     return jsonify({"received": True}), 200
 

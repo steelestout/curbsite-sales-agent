@@ -240,6 +240,8 @@ _LEAD_MIGRATIONS: list[tuple[str, str]] = [
     ("stripe_deposit_id",    "TEXT"),
     ("stripe_final_id",      "TEXT"),
     ("stripe_payment_url",   "TEXT"),
+    ("payment_processor",    "TEXT DEFAULT 'stripe'"),
+    ("square_payment_id",    "TEXT"),
 ]
 
 

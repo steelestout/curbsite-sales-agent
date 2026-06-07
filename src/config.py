@@ -123,6 +123,10 @@ STRIPE_SECRET_KEY: str = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_WEBHOOK_PORT: int = int(os.getenv("STRIPE_WEBHOOK_PORT", "5001"))
 
+# ── Square payments ───────────────────────────────────────────────────────────
+SQUARE_WEBHOOK_SIGNATURE_KEY: str = os.getenv("SQUARE_WEBHOOK_SIGNATURE_KEY", "")
+SQUARE_ACCESS_TOKEN: str = os.getenv("SQUARE_ACCESS_TOKEN", "")
+
 # ── Google PageSpeed Insights ─────────────────────────────────────────────────
 GOOGLE_PAGESPEED_API_KEY: str = os.getenv("GOOGLE_PAGESPEED_API_KEY", "")
 

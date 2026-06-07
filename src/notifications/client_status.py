@@ -249,6 +249,19 @@ def notify_payment_confirmed(lead: dict) -> None:
     if not email:
         return
 
+    processor = lead.get("payment_processor", "stripe")
+    if processor == "square":
+        txn_id = lead.get("square_payment_id", "")
+    else:
+        txn_id = lead.get("stripe_final_id", "")
+    processor_label = "Square" if processor == "square" else "Stripe"
+    receipt_line = (
+        f'<p style="font-size:13px;color:#999;margin:0 0 16px;">'
+        f"Payment processed via {processor_label}"
+        + (f" · Ref: <code>{txn_id}</code>" if txn_id else "")
+        + "</p>"
+    )
+
     subject = f"Payment confirmed — {biz} goes live soon!"
     inner = (
         _p(f"Hey {first},", size=17, color="#1a1a1a")
@@ -264,6 +277,7 @@ def notify_payment_confirmed(lead: dict) -> None:
             size=14,
             color="#555",
         )
+        + receipt_line
         + _p(f"Almost there!<br><strong>Steele @ Curbsite</strong>")
     )
 
