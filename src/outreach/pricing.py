@@ -20,6 +20,10 @@ from typing import Optional
 FOUNDING_CLIENTS_TOTAL: int = 5
 FOUNDING_CLIENTS_REMAINING: int = int(os.getenv("FOUNDING_CLIENTS_REMAINING", "5"))
 
+# ── Care plan price range (used in dossiers and email copy) ───────────────────
+PRICE_CARE_MIN: int = 75   # entry-tier care plan ($/mo)
+PRICE_CARE_MAX: int = 125  # top-tier care plan ($/mo)
+
 # ── Per-niche pricing tables ──────────────────────────────────────────────────
 # Source: curbsite/components/landing/Pricing.tsx (live site)
 

@@ -4,6 +4,10 @@ services:
     build: .
     container_name: curbsite-agent
     restart: unless-stopped
+    # Scheduler daemon: runs pipeline Mon–Fri 8am, follow-ups 9am, report Mon 7am.
+    # Use `docker compose -f docker-compose.agent.yml run --rm curbsite-agent python main.py <cmd>`
+    # for one-off manual runs.
+    command: python -m src.scheduler
     env_file: .env
     network_mode: host
     volumes:
