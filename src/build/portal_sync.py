@@ -397,6 +397,9 @@ def assert_assets_ready(lead: dict, min_photos: int = 3) -> bool:
 
 # ── Account creation & status/invoice sync ────────────────────────────────────
 
+_DEPOSIT_TITLE = "Deposit (50%)"
+_FINAL_TITLE   = "Final payment (50%)"
+
 _PORTAL_STATUS_MAP: dict[str, str] = {
     "building":    "In Progress",
     "build_ready": "Awaiting Approval",
@@ -616,6 +619,38 @@ def sync_lead_status_to_portal(lead: dict) -> bool:
         return False
 
 
+def _patch_invoice_paid(
+    session: requests.Session,
+    invoice_id: str,
+    lead: dict,
+    payment_amount: float,
+    processor: str,
+    is_final: bool,
+) -> bool:
+    """PATCH a single invoice to Paid status."""
+    try:
+        resp = session.patch(
+            f"{_PORTAL_BASE}/api/invoices/{invoice_id}",
+            json={"status": "Paid"},
+            headers=_api_headers(),
+            timeout=15,
+        )
+        if resp.status_code in (200, 201, 204):
+            log.info(
+                "Invoice %s marked Paid for lead #%d: $%.2f via %s (final=%s)",
+                invoice_id, lead.get("id", 0), payment_amount, processor, is_final,
+            )
+            return True
+        log.error(
+            "Portal invoice sync failed for lead #%d (inv %s): HTTP %d — %s",
+            lead.get("id", 0), invoice_id, resp.status_code, resp.text[:200],
+        )
+        return False
+    except Exception as exc:
+        log.error("Portal invoice sync request failed: %s", exc)
+        return False
+
+
 def sync_invoice_to_portal(
     lead: dict,
     payment_amount: float,
@@ -624,7 +659,7 @@ def sync_invoice_to_portal(
     is_final: bool,
 ) -> bool:
     """
-    Mark the matching portal invoice as Paid via PATCH /api/invoices/{id}.
+    Mark the matching portal invoice(s) as Paid via PATCH /api/invoices/{id}.
 
     Coordination note: When clients pay through the portal's own Square checkout,
     the portal's /api/square/webhook automatically marks the invoice Paid — this
@@ -632,6 +667,16 @@ def sync_invoice_to_portal(
     portal. The sales agent's /webhook/square focuses only on pipeline state
     transitions (deposit → build, final → go-live); the portal invoice side is
     handled automatically by the portal's own Square webhook.
+
+    Matching strategy:
+      1. Direct match: if stripeSessionId (or Square order_id) on an invoice
+         equals transaction_id, use that invoice.
+      2. Otherwise, collect all Unpaid invoices in arrival order and:
+         - Deposit (is_final=False): mark the FIRST Unpaid invoice as Paid.
+         - Final   (is_final=True):  mark ALL remaining Unpaid invoices as Paid.
+
+    The portal auto-creates two equal-amount Unpaid invoices per project (deposit
+    then final), so positional matching is reliable when no direct ID match exists.
 
     Args:
         lead:           CRM lead dict (portal_client_id preferred; email as fallback)
@@ -659,7 +704,7 @@ def sync_invoice_to_portal(
             )
             return False
 
-    # Fetch projects with embedded invoices to find the matching one
+    # Fetch projects with embedded invoices
     projects = _list_projects(session, portal_client_id)
     if not projects:
         log.warning(
@@ -667,53 +712,44 @@ def sync_invoice_to_portal(
         )
         return False
 
-    invoice_id: Optional[str] = None
+    all_invoices: list[dict] = []
     for project in projects:
-        for inv in project.get("invoices", []):
-            if (inv.get("status") or "").lower() == "paid":
-                continue
-            # Prefer match by payment session ID stored on the invoice
-            if inv.get("stripeSessionId") == transaction_id:
-                invoice_id = inv.get("id")
-                break
-            # Fall back: match by invoice type (portal auto-creates deposit + final)
-            inv_type = (inv.get("type") or "").lower()
-            if is_final and inv_type == "final":
-                invoice_id = inv.get("id")
-                break
-            if not is_final and inv_type == "deposit":
-                invoice_id = inv.get("id")
-                break
-        if invoice_id:
-            break
+        all_invoices.extend(project.get("invoices", []))
 
-    if not invoice_id:
-        log.warning(
-            "sync_invoice_to_portal: no unpaid %s invoice found for lead #%d (client %s)",
-            "final" if is_final else "deposit",
-            lead.get("id", 0),
-            portal_client_id,
-        )
-        return False
-
-    try:
-        resp = session.patch(
-            f"{_PORTAL_BASE}/api/invoices/{invoice_id}",
-            json={"status": "Paid"},
-            headers=_api_headers(),
-            timeout=15,
-        )
-        if resp.status_code in (200, 201, 204):
-            log.info(
-                "Invoice %s marked Paid for lead #%d: $%.2f via %s (final=%s)",
-                invoice_id, lead.get("id", 0), payment_amount, processor, is_final,
+    # Direct match: stripeSessionId / Square order_id stored on the invoice
+    for inv in all_invoices:
+        if inv.get("stripeSessionId") == transaction_id:
+            return _patch_invoice_paid(
+                session, inv["id"], lead, payment_amount, processor, is_final
             )
-            return True
-        log.error(
-            "Portal invoice sync failed for lead #%d (inv %s): HTTP %d — %s",
-            lead.get("id", 0), invoice_id, resp.status_code, resp.text[:200],
+
+    # Title-based match: portal creates invoices titled "{name} — Deposit (50%)"
+    # and "{name} — Final payment (50%)" — match on the label substring.
+    label = _FINAL_TITLE if is_final else _DEPOSIT_TITLE
+    candidates = [
+        inv for inv in all_invoices
+        if label in (inv.get("title") or "")
+        and (inv.get("status") or "").lower() == "unpaid"
+    ]
+
+    if not candidates:
+        log.warning(
+            "sync_invoice_to_portal: no Unpaid invoices matching '%s' for lead #%d (client %s)",
+            label, lead.get("id", 0), portal_client_id,
         )
         return False
-    except Exception as exc:
-        log.error("Portal invoice sync request failed: %s", exc)
-        return False
+
+    if not is_final:
+        # Deposit: mark only the first matching Unpaid invoice
+        return _patch_invoice_paid(
+            session, candidates[0]["id"], lead, payment_amount, processor, is_final
+        )
+
+    # Final: mark all matching Unpaid invoices
+    success = True
+    for inv in candidates:
+        if not _patch_invoice_paid(
+            session, inv["id"], lead, payment_amount, processor, is_final
+        ):
+            success = False
+    return success
