@@ -20,6 +20,15 @@ Stripe webhook registration:
 Square webhook registration:
   URL: https://curbsite.co/webhook/square
   Events: payment.completed
+
+Portal + Square coordination:
+  The curbsite.co portal has its own Square webhook at /api/square/webhook that
+  automatically marks invoices Paid when clients pay through the portal checkout.
+  This sales-agent webhook (/webhook/square) is responsible ONLY for pipeline state
+  transitions (deposit → kick off build, final → trigger go-live). Do not duplicate
+  the invoice-marking logic here for Square payments — let the portal handle it.
+  For Stripe payments, sync_invoice_to_portal() is still needed since the portal
+  has no Stripe webhook of its own.
 """
 
 import logging

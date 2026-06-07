@@ -398,114 +398,163 @@ def assert_assets_ready(lead: dict, min_photos: int = 3) -> bool:
 # ── Account creation & status/invoice sync ────────────────────────────────────
 
 _PORTAL_STATUS_MAP: dict[str, str] = {
-    "building":    "Your site is being designed",
-    "build_ready": "Your site is ready for review — please approve",
-    "deployed":    "Almost live — awaiting final payment",
-    "live":        "Your site is live! 🎉",
+    "building":    "In Progress",
+    "build_ready": "Awaiting Approval",
+    "deployed":    "Final Review",
+    "live":        "Complete",
 }
 
-# Fallback tier prices (USD) used when actual payment amount is unavailable.
-_TIER_PRICES: dict[str, float] = {"entry": 800.0, "mid": 1500.0, "top": 2600.0}
+TIER_TO_PACKAGE: dict[str, str] = {
+    "entry": "Entry",
+    "mid":   "Mid",
+    "top":   "Top",
+}
+
+
+def _save_portal_ids(lead_id: int, client_id: str = "", project_id: str = "") -> None:
+    """Write portal IDs into the leads table."""
+    from src.crm.database import get_conn
+    now = datetime.utcnow().isoformat()
+    updates: list[str] = []
+    vals: list = []
+    if client_id:
+        updates.append("portal_client_id=?")
+        vals.append(client_id)
+    if project_id:
+        updates.append("portal_project_id=?")
+        vals.append(project_id)
+    if not updates:
+        return
+    updates.append("updated_at=?")
+    vals.extend([now, lead_id])
+    with get_conn() as conn:
+        conn.execute(f"UPDATE leads SET {', '.join(updates)} WHERE id=?", vals)
 
 
 def create_portal_account(lead: dict) -> Optional[str]:
     """
-    Create a new client account in the curbsite.co CRM portal via the owner API.
+    Create a new client account and project in the curbsite.co portal.
 
     Returns:
       - The temporary password string when a new account is created.
       - "__existing__" when the account already exists (idempotent).
       - None on failure.
 
-    TODO (Steele): Confirm the exact admin endpoint before this goes live.
-    Current assumption:
-      POST /api/admin/clients
-      Body: {"email": ..., "name": ..., "businessName": ..., "phone": ..., "tempPassword": ...}
-      Response: {"id": "...", "tempPassword": "..."} or {"id": "..."}
-
-    Other things Steele needs to verify:
-      1. Is the path /api/admin/clients or /api/crm/clients or /api/users?
-      2. Does the portal accept a tempPassword in the body, or does it auto-generate one?
-      3. Is CURBSITE_CRM_API_KEY the right auth, or does it need session cookies?
+    Steps:
+      1. POST /api/clients/register  (public, no auth) → get portal client id
+      2. POST /api/projects          (admin session)   → get portal project id
+    Both IDs are persisted to the leads table (portal_client_id, portal_project_id).
     """
     email = lead.get("email")
     if not email:
         return None
 
-    temp_password = secrets.token_urlsafe(10)  # e.g. "xK9mQpR2nT"
+    temp_password = secrets.token_urlsafe(10)
 
-    if _CRM_API_KEY:
-        headers = {
-            "Authorization": f"Bearer {_CRM_API_KEY}",
-            "Content-Type": "application/json",
-            "User-Agent": "CurbsiteAgent/1.0",
-        }
-        session = requests.Session()
-        session.headers.update(headers)
+    # Admin session needed for project creation; also used to check existing accounts.
+    session = _get_session()
+    if session is None:
+        log.warning("create_portal_account: portal login failed for %s", email)
+        return None
+
+    # ── Step 1: Register client (public endpoint — no auth) ───────────────────
+    portal_client_id = lead.get("portal_client_id") or _find_client_id(session, email)
+    result: Optional[str]
+
+    if portal_client_id:
+        log.info(
+            "Portal client already exists for %s (id=%s) — skipping registration",
+            email, portal_client_id,
+        )
+        result = "__existing__"
     else:
-        session = _get_session()
-        if session is None:
-            log.warning("create_portal_account: portal login failed for %s", email)
+        try:
+            reg_resp = requests.post(
+                f"{_PORTAL_BASE}/api/clients/register",
+                json={
+                    "name":         lead.get("owner_name") or lead.get("business_name", ""),
+                    "email":        email,
+                    "password":     temp_password,
+                    "businessName": lead.get("business_name", ""),
+                    "phone":        lead.get("phone", ""),
+                },
+                headers={"Content-Type": "application/json", "User-Agent": "CurbsiteAgent/1.0"},
+                timeout=15,
+            )
+            if reg_resp.status_code not in (200, 201):
+                log.error(
+                    "Portal client registration failed for %s: HTTP %d — %s",
+                    email, reg_resp.status_code, reg_resp.text[:300],
+                )
+                return None
+            data = reg_resp.json()
+            portal_client_id = (
+                data.get("id")
+                or (data.get("client") or {}).get("id")
+            )
+            if not portal_client_id:
+                log.error("Portal registration response missing client id: %s", data)
+                return None
+            log.info("Portal client registered for %s (id=%s, lead #%d)", email, portal_client_id, lead.get("id", 0))
+            result = temp_password
+        except Exception as exc:
+            log.error("Portal client registration request failed: %s", exc)
             return None
 
-    # Skip creation if account already exists (idempotent)
-    existing_id = _find_client_id(session, email)
-    if existing_id:
-        log.info(
-            "Portal account already exists for %s (id=%s) — skipping creation",
-            email, existing_id,
-        )
-        return "__existing__"
+    _save_portal_ids(lead["id"], client_id=portal_client_id)
 
+    # ── Step 2: Create project (admin session) ────────────────────────────────
+    if lead.get("portal_project_id"):
+        log.debug("Portal project already exists for lead #%d — skipping", lead.get("id", 0))
+        return result
+
+    package = TIER_TO_PACKAGE.get((lead.get("tier") or "entry").lower(), "Entry")
+    biz_name = lead.get("business_name", "Website")
     try:
-        # TODO: Replace /api/admin/clients with the actual endpoint.
-        # Steele — check the curbsite.co CRM codebase (Next.js /pages/api/admin/clients.ts
-        # or similar) and update this URL + body schema to match.
-        resp = session.post(
-            f"{_PORTAL_BASE}/api/admin/clients",
+        proj_resp = session.post(
+            f"{_PORTAL_BASE}/api/projects",
             json={
-                "email": email,
-                "name": lead.get("owner_name") or lead.get("business_name", ""),
-                "businessName": lead.get("business_name", ""),
-                "phone": lead.get("phone", ""),
-                "tempPassword": temp_password,
+                "clientId":    portal_client_id,
+                "name":        f"{biz_name} Website",
+                "description": f"Website project for {biz_name}",
+                "package":     package,
+                "status":      "Discovery",
             },
-            headers=_api_headers() if not _CRM_API_KEY else {},
+            headers=_api_headers(),
             timeout=15,
         )
-        if resp.status_code in (200, 201):
-            data = resp.json()
-            # Use portal-generated password if returned, otherwise use ours
-            portal_pass = data.get("tempPassword") or data.get("password")
-            log.info("Portal account created for %s (lead #%d)", email, lead.get("id", 0))
-            return portal_pass or temp_password
-
-        log.error(
-            "Portal account creation failed for %s: HTTP %d — %s\n"
-            "  → Steele: set CURBSITE_CRM_API_KEY in .env and confirm the endpoint above.",
-            email, resp.status_code, resp.text[:300],
+        if proj_resp.status_code not in (200, 201):
+            log.error(
+                "Portal project creation failed for lead #%d: HTTP %d — %s",
+                lead.get("id", 0), proj_resp.status_code, proj_resp.text[:300],
+            )
+            return result  # client was created; project failed but not fatal
+        proj_data = proj_resp.json()
+        portal_project_id = (
+            proj_data.get("id")
+            or (proj_data.get("project") or {}).get("id")
         )
-        return None
+        if portal_project_id:
+            _save_portal_ids(lead["id"], project_id=portal_project_id)
+            log.info(
+                "Portal project created for lead #%d (project_id=%s, package=%s)",
+                lead.get("id", 0), portal_project_id, package,
+            )
+        else:
+            log.warning("Portal project creation response missing id: %s", proj_data)
     except Exception as exc:
-        log.error("Portal account creation request failed: %s", exc)
-        return None
+        log.error("Portal project creation request failed: %s", exc)
+
+    return result
 
 
 def sync_lead_status_to_portal(lead: dict) -> bool:
     """
-    Push the current pipeline status to the client's portal project so they
-    can log in and see live progress.
+    Push the current pipeline status to the client's portal project.
 
-    Only syncs statuses listed in _PORTAL_STATUS_MAP; silently skips others.
-    Returns True on success.
-
-    TODO (Steele): Confirm the PUT/PATCH endpoint once portal API docs are available.
-    Current assumption:
-      PUT /api/admin/projects/{projectId}
-      Body: {"status": "<human-readable label>"}
-    Alternative endpoints to check in the portal codebase:
-      PATCH /api/admin/clients/{clientId}/status
-      PUT   /api/crm/projects/{projectId}
+    Uses lead.portal_project_id directly when available; falls back to
+    email → client lookup → first project scan. Only syncs statuses in
+    _PORTAL_STATUS_MAP; silently skips others. Returns True on success.
     """
     status = lead.get("status", "")
     portal_label = _PORTAL_STATUS_MAP.get(status)
@@ -515,54 +564,51 @@ def sync_lead_status_to_portal(lead: dict) -> bool:
         )
         return False
 
-    email = lead.get("email")
-    if not email:
-        return False
-
     session = _get_session()
     if session is None:
         log.warning("sync_lead_status_to_portal: portal login failed — status sync skipped")
         return False
 
-    client_id = _find_client_id(session, email)
-    if not client_id:
-        log.warning(
-            "sync_lead_status_to_portal: client %s not found in portal — "
-            "call create_portal_account first",
-            email,
-        )
-        return False
-
-    projects = _list_projects(session, client_id)
-    if not projects:
-        log.warning(
-            "sync_lead_status_to_portal: no portal project for client %s", client_id
-        )
-        return False
-
-    project_id = projects[0].get("id")
-    if not project_id:
-        return False
+    portal_project_id = lead.get("portal_project_id")
+    if not portal_project_id:
+        # Fall back to lookup via email
+        email = lead.get("email")
+        if not email:
+            return False
+        client_id = lead.get("portal_client_id") or _find_client_id(session, email)
+        if not client_id:
+            log.warning(
+                "sync_lead_status_to_portal: client %s not found in portal — "
+                "call create_portal_account first",
+                email,
+            )
+            return False
+        projects = _list_projects(session, client_id)
+        if not projects:
+            log.warning(
+                "sync_lead_status_to_portal: no portal project for client %s", client_id
+            )
+            return False
+        portal_project_id = projects[0].get("id")
+        if not portal_project_id:
+            return False
 
     try:
-        # TODO: Replace /api/admin/projects/{project_id} with the actual endpoint.
-        # Steele — check the curbsite.co CRM codebase for the project update route.
-        resp = session.put(
-            f"{_PORTAL_BASE}/api/admin/projects/{project_id}",
+        resp = session.patch(
+            f"{_PORTAL_BASE}/api/projects/{portal_project_id}",
             json={"status": portal_label},
             headers=_api_headers(),
             timeout=15,
         )
         if resp.status_code in (200, 201, 204):
             log.info(
-                "Portal status updated for lead #%d (%s): '%s' → '%s'",
-                lead.get("id", 0), email, status, portal_label,
+                "Portal status updated for lead #%d: '%s' → '%s'",
+                lead.get("id", 0), status, portal_label,
             )
             return True
-
         log.error(
-            "Portal status sync failed for %s: HTTP %d — %s",
-            email, resp.status_code, resp.text[:200],
+            "Portal status sync failed for lead #%d: HTTP %d — %s",
+            lead.get("id", 0), resp.status_code, resp.text[:200],
         )
         return False
     except Exception as exc:
@@ -578,31 +624,26 @@ def sync_invoice_to_portal(
     is_final: bool,
 ) -> bool:
     """
-    Record a payment against the client's portal invoice.
+    Mark the matching portal invoice as Paid via PATCH /api/invoices/{id}.
+
+    Coordination note: When clients pay through the portal's own Square checkout,
+    the portal's /api/square/webhook automatically marks the invoice Paid — this
+    function handles Stripe payments and any Square payments initiated outside the
+    portal. The sales agent's /webhook/square focuses only on pipeline state
+    transitions (deposit → build, final → go-live); the portal invoice side is
+    handled automatically by the portal's own Square webhook.
 
     Args:
-        lead:           CRM lead dict (must have 'email')
-        payment_amount: Amount paid in USD (e.g. 750.0 for $750)
+        lead:           CRM lead dict (portal_client_id preferred; email as fallback)
+        payment_amount: Amount paid in USD
         processor:      'stripe' | 'square'
         transaction_id: Payment reference ID from the processor
-        is_final:       True = final payment ("Paid in full"); False = deposit
-
-    Returns True on success.
-
-    TODO (Steele): Confirm the invoice endpoint once portal API docs are available.
-    Current assumption:
-      POST /api/admin/invoices
-      Body: {"clientId": ..., "projectId": ..., "amountPaid": ...,
-             "processor": ..., "transactionId": ..., "isFinal": ...,
-             "datePaid": ..., "remainingBalance": ..., "status": ...}
-    Alternative: PUT /api/admin/projects/{projectId}/invoice {...}
-
-    Steele needs to confirm:
-      1. Does the portal have an invoices table/model?
-      2. Should this POST (create new record) or PUT (update existing)?
+        is_final:       True = final payment, False = deposit
     """
+    portal_client_id = lead.get("portal_client_id")
     email = lead.get("email")
-    if not email:
+
+    if not portal_client_id and not email:
         return False
 
     session = _get_session()
@@ -610,50 +651,67 @@ def sync_invoice_to_portal(
         log.warning("sync_invoice_to_portal: portal login failed — invoice sync skipped")
         return False
 
-    client_id = _find_client_id(session, email)
-    if not client_id:
+    if not portal_client_id:
+        portal_client_id = _find_client_id(session, email)
+        if not portal_client_id:
+            log.warning(
+                "sync_invoice_to_portal: client %s not in portal — invoice sync skipped", email
+            )
+            return False
+
+    # Fetch projects with embedded invoices to find the matching one
+    projects = _list_projects(session, portal_client_id)
+    if not projects:
         log.warning(
-            "sync_invoice_to_portal: client %s not in portal — invoice sync skipped", email
+            "sync_invoice_to_portal: no projects found for client %s", portal_client_id
         )
         return False
 
-    projects = _list_projects(session, client_id)
-    project_id = projects[0].get("id") if projects else None
+    invoice_id: Optional[str] = None
+    for project in projects:
+        for inv in project.get("invoices", []):
+            if (inv.get("status") or "").lower() == "paid":
+                continue
+            # Prefer match by payment session ID stored on the invoice
+            if inv.get("stripeSessionId") == transaction_id:
+                invoice_id = inv.get("id")
+                break
+            # Fall back: match by invoice type (portal auto-creates deposit + final)
+            inv_type = (inv.get("type") or "").lower()
+            if is_final and inv_type == "final":
+                invoice_id = inv.get("id")
+                break
+            if not is_final and inv_type == "deposit":
+                invoice_id = inv.get("id")
+                break
+        if invoice_id:
+            break
 
-    total_price = _TIER_PRICES.get(lead.get("tier") or "entry", 800.0)
-    remaining = 0.0 if is_final else max(0.0, total_price - payment_amount)
-
-    payload = {
-        "clientId": client_id,
-        "projectId": project_id,
-        "amountPaid": round(payment_amount, 2),
-        "processor": processor.title(),        # "Stripe" or "Square"
-        "transactionId": transaction_id,
-        "isFinal": is_final,
-        "datePaid": datetime.utcnow().isoformat(),
-        "remainingBalance": round(remaining, 2),
-        "status": "Paid in full" if is_final else "Deposit received",
-    }
+    if not invoice_id:
+        log.warning(
+            "sync_invoice_to_portal: no unpaid %s invoice found for lead #%d (client %s)",
+            "final" if is_final else "deposit",
+            lead.get("id", 0),
+            portal_client_id,
+        )
+        return False
 
     try:
-        # TODO: Replace /api/admin/invoices with the actual portal endpoint.
-        # Steele — check the curbsite.co CRM codebase for the invoice API route.
-        resp = session.post(
-            f"{_PORTAL_BASE}/api/admin/invoices",
-            json=payload,
+        resp = session.patch(
+            f"{_PORTAL_BASE}/api/invoices/{invoice_id}",
+            json={"status": "Paid"},
             headers=_api_headers(),
             timeout=15,
         )
         if resp.status_code in (200, 201, 204):
             log.info(
-                "Invoice synced to portal for lead #%d: $%.2f via %s (final=%s)",
-                lead.get("id", 0), payment_amount, processor, is_final,
+                "Invoice %s marked Paid for lead #%d: $%.2f via %s (final=%s)",
+                invoice_id, lead.get("id", 0), payment_amount, processor, is_final,
             )
             return True
-
         log.error(
-            "Portal invoice sync failed for %s: HTTP %d — %s",
-            email, resp.status_code, resp.text[:200],
+            "Portal invoice sync failed for lead #%d (inv %s): HTTP %d — %s",
+            lead.get("id", 0), invoice_id, resp.status_code, resp.text[:200],
         )
         return False
     except Exception as exc:
