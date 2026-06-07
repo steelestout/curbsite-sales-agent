@@ -181,11 +181,15 @@ CREATE INDEX IF NOT EXISTS idx_leads_status      ON leads(status);
 CREATE INDEX IF NOT EXISTS idx_leads_score       ON leads(score DESC);
 CREATE INDEX IF NOT EXISTS idx_leads_email       ON leads(email);
 CREATE INDEX IF NOT EXISTS idx_leads_review      ON leads(review_needed);
-CREATE INDEX IF NOT EXISTS idx_leads_golive      ON leads(golive_at);
 CREATE INDEX IF NOT EXISTS idx_followup_sched    ON followup_queue(scheduled_for, sent);
 CREATE INDEX IF NOT EXISTS idx_approval_token    ON approval_tokens(token);
 CREATE INDEX IF NOT EXISTS idx_pagespeed_url     ON pagespeed_cache(url);
 """
+
+# Indexes that depend on columns added via migration (can't be in SCHEMA executescript).
+_POST_MIGRATION_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_leads_golive ON leads(golive_at)",
+]
 
 
 # ── Connection helper ─────────────────────────────────────────────────────────
@@ -248,11 +252,16 @@ def _migrate_leads(conn: sqlite3.Connection) -> None:
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
-    """Create tables and run column migrations."""
+    """Create tables, run column migrations, then create post-migration indexes."""
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA)
         _migrate_leads(conn)
         _migrate_outreach_log(conn)
+        for sql in _POST_MIGRATION_INDEXES:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
     log.info("Database ready: %s", db_path)
 
 
