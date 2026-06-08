@@ -14,6 +14,7 @@ Falls back to a lightweight Google Maps scrape if no Yelp key.
 
 import json
 import logging
+import random
 import time
 from typing import Optional
 
@@ -26,19 +27,25 @@ from src.config import (
     PROSPECTING_DELAY,
 )
 from src.crm.database import upsert_lead
+from src.prospecting.locations import get_next_cities, mark_city_scraped
 
 log = logging.getLogger(__name__)
 
 YELP_API_URL = "https://api.yelp.com/v3/businesses/search"
 GOOGLE_PLACES_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+]
+
+
+def _headers() -> dict:
+    return {"User-Agent": random.choice(_USER_AGENTS)}
 
 
 # ── Yelp ──────────────────────────────────────────────────────────────────────
@@ -97,7 +104,7 @@ def scrape_google_maps(query: str, limit: int = 10) -> list[dict]:
     """
     url = f"https://www.google.com/search?q={requests.utils.quote(query)}&tbm=lcl"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=_headers(), timeout=15)
         resp.raise_for_status()
     except requests.RequestException as e:
         log.warning("Google scrape failed for '%s': %s", query, e)
@@ -149,7 +156,7 @@ def detect_website(business_name: str, city: str) -> Optional[str]:
     query = f"{business_name} {city} official website"
     url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=_headers(), timeout=10)
         soup = BeautifulSoup(resp.text, "lxml")
         for a in soup.select("a[href]"):
             href = a["href"]
@@ -174,7 +181,7 @@ def check_website_quality(url: str) -> str:
     if not url:
         return "none"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+        resp = requests.get(url, headers=_headers(), timeout=10, allow_redirects=True)
         if resp.status_code >= 400:
             return "none"
         html = resp.text
@@ -206,36 +213,53 @@ def prospect(
     yelp_api_key: Optional[str] = None,
     cities: Optional[list[str]] = None,
     niches: Optional[list[str]] = None,
+    n_cities: int = 6,
 ) -> int:
     """
     Run a full prospecting pass. Returns number of leads upserted.
+
+    When cities is None and TARGET_CITIES env var is not set, automatically
+    selects cities using the 30-day rotation system across IN/IL/MI/OH/KY/MO.
+    Pass cities=[...] or set TARGET_CITIES env var to override.
     """
-    cities = cities or TARGET_CITIES
+    if cities is not None:
+        city_entries = [{"city": c, "state": "", "tier": 2} for c in cities]
+    elif TARGET_CITIES:
+        city_entries = [{"city": c, "state": "", "tier": 2} for c in TARGET_CITIES]
+    else:
+        city_entries = get_next_cities(n=n_cities)
+
     niches = niches or TARGET_NICHES
     count = 0
 
-    for city in cities:
+    for entry in city_entries:
+        city = entry["city"]
+        state = entry.get("state", "")
+        location = f"{city}, {state}" if state else city
+        city_count = 0
+
         for niche in niches:
-            log.info("Prospecting: %s in %s", niche, city)
+            log.info("Prospecting: %s in %s", niche, location)
             leads: list[dict] = []
 
             if yelp_api_key:
                 try:
-                    raw = search_yelp(niche, city, yelp_api_key)
+                    raw = search_yelp(niche, location, yelp_api_key)
                     leads = [yelp_to_lead(b, niche, city) for b in raw]
                     log.info("  Yelp: %d results", len(leads))
                 except Exception as e:
                     log.warning("  Yelp failed: %s", e)
             else:
-                google_leads = scrape_google_maps(f"{niche} in {city}")
+                google_leads = scrape_google_maps(f"{niche} in {location}")
                 for lead in google_leads:
                     lead["niche"] = niche
                     lead["city"] = lead.get("city") or city
+                    if state and not lead.get("state"):
+                        lead["state"] = state
                 leads = google_leads
                 log.info("  Google scrape: %d results", len(leads))
 
             for lead in leads:
-                # Detect real website if not found
                 if not lead.get("website") or "yelp.com" in (lead.get("website") or ""):
                     found = detect_website(lead["business_name"], lead.get("city", city))
                     if found:
@@ -251,7 +275,12 @@ def prospect(
 
                 upsert_lead(lead)
                 count += 1
-                time.sleep(PROSPECTING_DELAY)
+                city_count += 1
+                time.sleep(PROSPECTING_DELAY + random.uniform(0, 3))
+
+        if state:
+            mark_city_scraped(city, state)
+        log.info("  City done: %s — %d leads", location, city_count)
 
     log.info("Prospecting complete — %d leads upserted", count)
     return count

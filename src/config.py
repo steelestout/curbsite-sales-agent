@@ -35,7 +35,7 @@ AGENCY_OWNER: str = os.getenv("AGENCY_OWNER", "Steele Stout")
 
 # ── Targeting ────────────────────────────────────────────────────────────────
 TARGET_CITIES: list[str] = [
-    c.strip() for c in os.getenv("TARGET_CITIES", "Kokomo").split(",") if c.strip()
+    c.strip() for c in os.getenv("TARGET_CITIES", "").split(",") if c.strip()
 ]
 TARGET_NICHES: list[str] = [
     n.strip()
