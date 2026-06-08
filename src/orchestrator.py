@@ -536,6 +536,8 @@ def run_top_of_funnel(dry_run: bool = False, yelp_key: str = None) -> None:
     )
 
 
+run_full_pipeline = run_top_of_funnel  # alias for scheduler.py compat
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
