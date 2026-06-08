@@ -161,7 +161,7 @@ def score_all_new_leads(use_ai: bool = True) -> dict:
     leads = get_leads(status="new", limit=500)
     if not leads:
         log.info("No new leads to score.")
-        return {"scored": 0, "high_value": 0}
+        return {"scored": 0, "avg_score": 0.0, "high_value": 0}
 
     log.info("Scoring %d leads...", len(leads))
     scores = []
