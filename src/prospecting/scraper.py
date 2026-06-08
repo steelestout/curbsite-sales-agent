@@ -94,80 +94,122 @@ def yelp_to_lead(biz: dict, niche: str, city: str) -> dict:
     }
 
 
-# ── Google Maps (no-key scrape) ───────────────────────────────────────────────
+# ── OpenStreetMap / Overpass (no-key scrape, replaces Google Maps) ────────────
 
-def scrape_google_maps(query: str, limit: int = 10) -> list[dict]:
-    """
-    Lightweight scrape of Google Maps search results.
-    No API key needed. Returns minimal lead dicts.
-    NOTE: Respects robots.txt spirit — only public listing data.
-    """
-    url = f"https://www.google.com/search?q={requests.utils.quote(query)}&tbm=lcl"
+_OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
+# Map our niches to OSM tag filters (Overpass QL node filter syntax)
+_NICHE_OSM_TAGS: dict[str, list[str]] = {
+    "restaurant":  ['["amenity"="restaurant"]', '["amenity"="cafe"]', '["amenity"="fast_food"]'],
+    "photography": ['["shop"="photography"]', '["craft"="photographer"]'],
+    "salon":       ['["shop"="hairdresser"]', '["shop"="beauty"]', '["shop"="nail_salon"]'],
+    "contractor":  ['["craft"~"builder|electrician|plumber|carpenter|roofer|hvac"]'],
+    "fitness":     ['["leisure"~"fitness_centre|gym"]', '["amenity"="gym"]'],
+    "dental":      ['["amenity"="dentist"]'],
+    "auto":        ['["shop"~"car_repair|tyres|car"]'],
+    "legal":       ['["office"="lawyer"]'],
+    "real_estate": ['["office"="real_estate_agent"]'],
+}
+
+
+def _city_bbox(city: str, state: str) -> Optional[tuple[float, float, float, float]]:
+    """Return (south, west, north, east) bounding box via Nominatim."""
     try:
-        resp = requests.get(url, headers=_headers(), timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        log.warning("Google scrape failed for '%s': %s", query, e)
+        r = requests.get(
+            _NOMINATIM_URL,
+            params={"q": f"{city}, {state}, USA", "format": "json", "limit": 1},
+            headers={"User-Agent": "curbsite-leads/1.0 (contact@curbsite.co)"},
+            timeout=12,
+        )
+        results = r.json()
+        if not results:
+            log.warning("Nominatim: no result for %s, %s", city, state)
+            return None
+        bb = results[0]["boundingbox"]  # [south_lat, north_lat, west_lon, east_lon]
+        return float(bb[0]), float(bb[2]), float(bb[1]), float(bb[3])
+    except Exception as e:
+        log.warning("Nominatim failed for %s, %s: %s", city, state, e)
+        return None
+
+
+def search_overpass(niche: str, city: str, state: str, limit: int = 20) -> list[dict]:
+    """
+    Query OpenStreetMap via Overpass API for local businesses.
+    Free, no API key. Returns lead dicts.
+    Businesses with no website are valuable leads — they need our service.
+    """
+    bbox_tuple = _city_bbox(city, state)
+    if not bbox_tuple:
         return []
+    south, west, north, east = bbox_tuple
+    bbox = f"{south},{west},{north},{east}"
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    results = []
-    # Google Maps local pack — grab business names from structured data if available
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            if isinstance(data, list):
-                for item in data:
-                    if item.get("@type") in ("LocalBusiness", "Restaurant", "Store"):
-                        results.append(_ld_to_lead(item))
-            elif data.get("@type") in ("LocalBusiness", "Restaurant", "Store"):
-                results.append(_ld_to_lead(data))
-        except (json.JSONDecodeError, AttributeError):
-            continue
-        if len(results) >= limit:
-            break
-    return results
+    tag_filters = _NICHE_OSM_TAGS.get(niche.lower(), ['["amenity"="restaurant"]'])
+    node_lines = "\n".join(f'  node{tf}["name"]({bbox});' for tf in tag_filters)
+    query = f'[out:json][timeout:25];\n(\n{node_lines}\n);\nout {limit};'
 
+    try:
+        time.sleep(random.uniform(1, 2))  # respect Overpass rate limits
+        resp = requests.get(
+            _OVERPASS_URL,
+            params={"data": query},
+            headers={"User-Agent": "curbsite-leads/1.0 (contact@curbsite.co)"},
+            timeout=35,
+        )
+        if resp.status_code != 200:
+            log.warning("Overpass %d for %s in %s, %s", resp.status_code, niche, city, state)
+            return []
 
-def _ld_to_lead(data: dict) -> dict:
-    addr = data.get("address", {})
-    return {
-        "business_name": data.get("name", ""),
-        "phone": data.get("telephone", ""),
-        "website": data.get("url", ""),
-        "city": addr.get("addressLocality", ""),
-        "state": addr.get("addressRegion", ""),
-        "niche": "",
-        "has_website": 1 if data.get("url") else 0,
-        "source": "google_scrape",
-        "status": "new",
-        "social_links": json.dumps({}),
-        "score_reasons": json.dumps([]),
-    }
+        elements = resp.json().get("elements", [])
+        results = []
+        for el in elements:
+            tags = el.get("tags", {})
+            name = tags.get("name", "").strip()
+            if not name:
+                continue
+            website = tags.get("website") or tags.get("contact:website") or ""
+            phone = tags.get("phone") or tags.get("contact:phone") or tags.get("contact:mobile") or ""
+            results.append({
+                "business_name": name,
+                "phone": phone,
+                "website": website,
+                "niche": niche,
+                "city": tags.get("addr:city") or city,
+                "state": tags.get("addr:state") or state,
+                "has_website": 1 if website else 0,
+                "source": "overpass",
+                "status": "new",
+                "social_links": json.dumps({}),
+                "score_reasons": json.dumps([]),
+            })
+        log.info("  Overpass: %d results for %s in %s, %s", len(results), niche, city, state)
+        return results
+    except Exception as e:
+        log.warning("Overpass failed for %s in %s, %s: %s", niche, city, state, e)
+        return []
 
 
 # ── Website detection ─────────────────────────────────────────────────────────
 
 def detect_website(business_name: str, city: str) -> Optional[str]:
     """
-    Try to find a business's own website (not Yelp/Facebook).
-    Uses a simple Google search.
+    Try to find a business's own website via DuckDuckGo HTML search.
+    Google blocks VPS IPs; DuckDuckGo is more permissive.
     """
     query = f"{business_name} {city} official website"
-    url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
+    url = f"https://duckduckgo.com/html/?q={requests.utils.quote(query)}"
+    _SKIP = ("yelp.com", "facebook.com", "google.com", "instagram.com",
+             "yellowpages.com", "bbb.org", "tripadvisor.com")
     try:
-        resp = requests.get(url, headers=_headers(), timeout=10)
+        resp = requests.get(url, headers=_headers(), timeout=12)
         soup = BeautifulSoup(resp.text, "lxml")
-        for a in soup.select("a[href]"):
-            href = a["href"]
-            if href.startswith("/url?q="):
-                target = href.split("/url?q=")[1].split("&")[0]
-                # Skip Yelp, Facebook, Google itself
-                if not any(
-                    skip in target
-                    for skip in ["yelp.com", "facebook.com", "google.com", "instagram.com"]
-                ):
-                    return requests.utils.unquote(target)
+        for a in soup.select("a.result__url, a[href*='uddg=']"):
+            href = a.get("href", "")
+            if "uddg=" in href:
+                href = requests.utils.unquote(href.split("uddg=")[1].split("&")[0])
+            if href.startswith("http") and not any(s in href for s in _SKIP):
+                return href
     except Exception as e:
         log.debug("Website detection failed for %s: %s", business_name, e)
     return None
@@ -250,14 +292,7 @@ def prospect(
                 except Exception as e:
                     log.warning("  Yelp failed: %s", e)
             else:
-                google_leads = scrape_google_maps(f"{niche} in {location}")
-                for lead in google_leads:
-                    lead["niche"] = niche
-                    lead["city"] = lead.get("city") or city
-                    if state and not lead.get("state"):
-                        lead["state"] = state
-                leads = google_leads
-                log.info("  Google scrape: %d results", len(leads))
+                leads = search_overpass(niche, city, state or "IN")
 
             for lead in leads:
                 if not lead.get("website") or "yelp.com" in (lead.get("website") or ""):
