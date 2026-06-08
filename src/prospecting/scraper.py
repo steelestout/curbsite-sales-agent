@@ -32,7 +32,11 @@ from src.prospecting.locations import get_next_cities, mark_city_scraped
 log = logging.getLogger(__name__)
 
 YELP_API_URL = "https://api.yelp.com/v3/businesses/search"
-GOOGLE_PLACES_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+GOOGLE_PLACES_V1_URL = "https://places.googleapis.com/v1/places:searchText"
+_PLACES_FIELD_MASK = (
+    "places.displayName,places.formattedAddress,places.nationalPhoneNumber,"
+    "places.websiteUri,places.rating,places.userRatingCount"
+)
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -94,7 +98,58 @@ def yelp_to_lead(biz: dict, niche: str, city: str) -> dict:
     }
 
 
-# ── OpenStreetMap / Overpass (no-key scrape, replaces Google Maps) ────────────
+# ── Google Places API (New) ───────────────────────────────────────────────────
+
+def search_google_places(
+    query: str,
+    api_key: str,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Query Google Places API (New) — requires Places API enabled in GCP console:
+    https://console.cloud.google.com/apis/library/places.googleapis.com
+    Uses GOOGLE_MAPS_API_KEY (same key as GOOGLE_PAGESPEED_API_KEY).
+    """
+    resp = requests.post(
+        GOOGLE_PLACES_V1_URL,
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": _PLACES_FIELD_MASK,
+        },
+        json={"textQuery": query, "maxResultCount": min(limit, 20)},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("places", [])
+
+
+def google_place_to_lead(place: dict, niche: str, city: str, state: str) -> dict:
+    addr = place.get("formattedAddress", "")
+    # Parse city/state from formattedAddress: "123 Main St, Indianapolis, IN 46201, USA"
+    addr_parts = [p.strip() for p in addr.split(",")]
+    parsed_city = addr_parts[-3] if len(addr_parts) >= 3 else city
+    parsed_state_zip = addr_parts[-2].strip().split() if len(addr_parts) >= 2 else []
+    parsed_state = parsed_state_zip[0] if parsed_state_zip else state
+
+    website = place.get("websiteUri", "")
+    return {
+        "business_name": place.get("displayName", {}).get("text", ""),
+        "phone": place.get("nationalPhoneNumber", ""),
+        "website": website,
+        "niche": niche,
+        "city": parsed_city or city,
+        "state": parsed_state or state,
+        "google_rating": place.get("rating"),
+        "review_count": place.get("userRatingCount", 0),
+        "has_website": 1 if website else 0,
+        "source": "google_places",
+        "status": "new",
+        "social_links": json.dumps({}),
+    }
+
+
+# ── OpenStreetMap / Overpass (no-key fallback) ────────────────────────────────
 
 _OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 _NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
@@ -253,6 +308,7 @@ def check_website_quality(url: str) -> str:
 
 def prospect(
     yelp_api_key: Optional[str] = None,
+    google_api_key: Optional[str] = None,
     cities: Optional[list[str]] = None,
     niches: Optional[list[str]] = None,
     n_cities: int = 6,
@@ -260,9 +316,9 @@ def prospect(
     """
     Run a full prospecting pass. Returns number of leads upserted.
 
+    Priority: Yelp → Google Places API (New) → Overpass (OSM).
     When cities is None and TARGET_CITIES env var is not set, automatically
     selects cities using the 30-day rotation system across IN/IL/MI/OH/KY/MO.
-    Pass cities=[...] or set TARGET_CITIES env var to override.
     """
     if cities is not None:
         city_entries = [{"city": c, "state": "", "tier": 2} for c in cities]
@@ -291,7 +347,16 @@ def prospect(
                     log.info("  Yelp: %d results", len(leads))
                 except Exception as e:
                     log.warning("  Yelp failed: %s", e)
-            else:
+
+            if not leads and google_api_key:
+                try:
+                    raw = search_google_places(f"{niche} in {location}", google_api_key)
+                    leads = [google_place_to_lead(p, niche, city, state) for p in raw]
+                    log.info("  Google Places: %d results", len(leads))
+                except Exception as e:
+                    log.warning("  Google Places failed: %s", e)
+
+            if not leads:
                 leads = search_overpass(niche, city, state or "IN")
 
             for lead in leads:

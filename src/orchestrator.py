@@ -91,9 +91,9 @@ log = logging.getLogger(__name__)
 
 # ── Pipeline steps ─────────────────────────────────────────────────────────────
 
-def step_prospect(yelp_key: str = None) -> None:
+def step_prospect(yelp_key: str = None, google_key: str = None) -> None:
     log.info("═══ STEP 1: PROSPECTING ═══")
-    count = prospect(yelp_api_key=yelp_key)
+    count = prospect(yelp_api_key=yelp_key, google_api_key=google_key)
     log.info("Done — %d leads stored.", count)
 
 
@@ -505,7 +505,7 @@ def step_report(days: int = 7) -> None:
 
 # ── Top-of-funnel pipeline (fully automated) ──────────────────────────────────
 
-def run_top_of_funnel(dry_run: bool = False, yelp_key: str = None) -> None:
+def run_top_of_funnel(dry_run: bool = False, yelp_key: str = None, google_key: str = None) -> None:
     """
     Run all automated top-of-funnel steps (prospect → close monitoring).
     Does NOT build or deploy — those require Steele's approval at two gates.
@@ -521,7 +521,7 @@ def run_top_of_funnel(dry_run: bool = False, yelp_key: str = None) -> None:
     6. Monitor inbox for replies
     """
     init_db()
-    step_prospect(yelp_key=yelp_key)
+    step_prospect(yelp_key=yelp_key, google_key=google_key)
     step_score()
     step_mockup(dry_run=dry_run, pre_outreach=True)   # generate BEFORE sending email
     step_outreach(dry_run=dry_run)
@@ -568,7 +568,12 @@ def main() -> None:
     parser.add_argument(
         "--yelp-key",
         default=os.getenv("YELP_API_KEY"),
-        help="Yelp Fusion API key (optional — falls back to Google scrape)",
+        help="Yelp Fusion API key (optional)",
+    )
+    parser.add_argument(
+        "--google-key",
+        default=os.getenv("GOOGLE_MAPS_API_KEY", os.getenv("GOOGLE_PAGESPEED_API_KEY")),
+        help="Google Maps/Places API key — requires Places API (New) enabled in GCP",
     )
     parser.add_argument(
         "--days",
@@ -603,7 +608,7 @@ def main() -> None:
 
     match args.step:
         case "prospect":
-            step_prospect(yelp_key=args.yelp_key)
+            step_prospect(yelp_key=args.yelp_key, google_key=args.google_key)
         case "score":
             step_score()
         case "outreach":
@@ -655,7 +660,7 @@ def main() -> None:
         case "report":
             step_report(days=args.days)
         case "all":
-            run_top_of_funnel(dry_run=args.dry_run, yelp_key=args.yelp_key)
+            run_top_of_funnel(dry_run=args.dry_run, yelp_key=args.yelp_key, google_key=args.google_key)
 
 
 if __name__ == "__main__":

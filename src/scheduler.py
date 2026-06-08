@@ -28,7 +28,11 @@ log = logging.getLogger(__name__)
 
 def _pipeline():
     from src.orchestrator import run_full_pipeline
-    run_full_pipeline(dry_run=False, yelp_key=os.getenv("YELP_API_KEY"))
+    run_full_pipeline(
+        dry_run=False,
+        yelp_key=os.getenv("YELP_API_KEY"),
+        google_key=os.getenv("GOOGLE_MAPS_API_KEY", os.getenv("GOOGLE_PAGESPEED_API_KEY")),
+    )
 
 
 def _followups():
