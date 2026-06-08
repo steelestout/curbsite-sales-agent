@@ -206,9 +206,10 @@ def search_overpass(niche: str, city: str, state: str, limit: int = 20) -> list[
 
     try:
         time.sleep(random.uniform(1, 2))  # respect Overpass rate limits
-        resp = requests.get(
+        # POST with form data — GET with params= triggers 406 on overpass-api.de
+        resp = requests.post(
             _OVERPASS_URL,
-            params={"data": query},
+            data={"data": query},
             headers={"User-Agent": "curbsite-leads/1.0 (contact@curbsite.co)"},
             timeout=35,
         )
