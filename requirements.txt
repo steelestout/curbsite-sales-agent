@@ -39,6 +39,13 @@ stripe>=9.0.0            # Stripe webhook handler
 flask>=3.0.0
 gunicorn>=22.0.0         # production WSGI server (Linux/VPS only)
 
+# Browser automation (Facebook enrichment)
+playwright>=1.44.0
+
+# Physical mail outreach
+lob>=4.5.0
+qrcode[pil]>=7.4.2
+
 # Testing
 pytest>=8.2.0
 pytest-mock>=3.14.0

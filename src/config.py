@@ -139,6 +139,14 @@ GOOGLE_REVIEW_URL: str = os.getenv("GOOGLE_REVIEW_URL", "")
 DASHBOARD_URL: str = os.getenv("DASHBOARD_URL", "http://localhost:5050")
 DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "5050"))
 
+# ── Lob.com (physical postcard outreach) ─────────────────────────────────────
+LOB_LIVE_MODE: bool = os.getenv("LOB_LIVE_MODE", "false").lower() == "true"
+LOB_API_KEY: str = (
+    os.getenv("LOB_API_KEY", "")
+    if LOB_LIVE_MODE
+    else os.getenv("LOB_TEST_API_KEY", "")
+)
+
 # ── Steele's personal notification email ──────────────────────────────────────
 STEELE_EMAIL: str = os.getenv("STEELE_EMAIL", "steele.stout@gmail.com")
 

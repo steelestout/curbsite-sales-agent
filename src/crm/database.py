@@ -244,6 +244,11 @@ _LEAD_MIGRATIONS: list[tuple[str, str]] = [
     ("square_payment_id",    "TEXT"),
     ("portal_client_id",     "TEXT"),
     ("portal_project_id",    "TEXT"),
+    # Postcard outreach (Lob.com)
+    ("address_line1",        "TEXT"),
+    ("zip_code",             "TEXT"),
+    ("postcard_id",          "TEXT"),
+    ("postcard_sent_at",     "TEXT"),
 ]
 
 

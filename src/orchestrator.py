@@ -3,7 +3,7 @@ Main orchestrator — runs the full Curbsite sales + build + deploy pipeline.
 
 State machine
 ─────────────
-new → scored → mockup_ready → emailed → followed_up → mockup_sent
+new → scored → mockup_ready → contacted (postcard) → emailed → followed_up → mockup_sent
     → agreed_pending → agreed → building → build_ready
     → domain_purchased → deployed → live
     (any stage → lost | unsubscribed)
@@ -54,6 +54,7 @@ Run via
   python -m src.orchestrator --dry-run               # no emails, no deploys
   python -m src.orchestrator --step close            # check inbox for replies
   python -m src.orchestrator --step mockup           # generate mockups for scored leads
+  python -m src.orchestrator --step postcard         # send physical postcards via Lob.com
   python -m src.orchestrator --step build --lead-id {id}          # GATE 1
   python -m src.orchestrator --step approve-build --lead-id {id}  # GATE 2 (manual bypass)
   python -m src.orchestrator --step domain    --lead-id {id}      # purchase domain
@@ -66,8 +67,10 @@ Run via
 """
 
 import argparse
+import json
 import logging
 import os
+import time
 
 from rich.logging import RichHandler
 
@@ -103,6 +106,87 @@ def step_score() -> None:
     log.info(
         "Done — %d leads scored | avg %.1f | high-value %d",
         stats["scored"], stats["avg_score"], stats["high_value"],
+    )
+
+
+def step_enrich(dry_run: bool = False) -> None:
+    """Query Facebook for email addresses on no-website, no-email scored leads."""
+    log.info("═══ STEP 2c: FACEBOOK ENRICHMENT ═══")
+    from datetime import datetime as _dt
+    from src.enrichment.facebook_scraper import enrich_lead_facebook_sync
+    from src.crm.database import get_conn
+
+    _DAILY_LIMIT = 50
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, business_name, city, state, social_links, phone
+               FROM leads
+               WHERE (website IS NULL OR website = '')
+                 AND (email IS NULL OR email = '')
+                 AND status = 'scored'
+               ORDER BY score DESC
+               LIMIT ?""",
+            (_DAILY_LIMIT,),
+        ).fetchall()
+
+    leads = [dict(r) for r in rows]
+    log.info("Found %d no-website, no-email leads to enrich via Facebook", len(leads))
+
+    enriched = 0
+    found_emails = 0
+    for lead in leads:
+        if dry_run:
+            log.info("[DRY RUN] Would enrich: %s, %s %s", lead["business_name"], lead["city"], lead["state"])
+            continue
+        try:
+            result = enrich_lead_facebook_sync(
+                lead["business_name"],
+                lead.get("city") or "",
+                lead.get("state") or "",
+            )
+            if result.get("email") or result.get("facebook_url") or result.get("phone"):
+                now = _dt.utcnow().isoformat()
+                updates: dict = {"updated_at": now}
+
+                if result.get("email"):
+                    updates["email"] = result["email"]
+                    found_emails += 1
+
+                # Only overwrite phone if we don't already have one
+                if result.get("phone") and not lead.get("phone"):
+                    updates["phone"] = result["phone"]
+
+                if result.get("facebook_url"):
+                    try:
+                        links = json.loads(lead.get("social_links") or "{}")
+                    except Exception:
+                        links = {}
+                    links["facebook"] = result["facebook_url"]
+                    updates["social_links"] = json.dumps(links)
+
+                with get_conn() as conn:
+                    set_clause = ", ".join(f"{k}=?" for k in updates)
+                    conn.execute(
+                        f"UPDATE leads SET {set_clause} WHERE id=?",
+                        [*updates.values(), lead["id"]],
+                    )
+                enriched += 1
+                log.info(
+                    "Enriched lead #%d (%s) — email: %s | FB: %s",
+                    lead["id"], lead["business_name"],
+                    result.get("email"), result.get("facebook_url"),
+                )
+        except Exception as exc:
+            log.warning(
+                "FB enrichment failed for lead #%d (%s): %s",
+                lead["id"], lead["business_name"], exc,
+            )
+        time.sleep(2)
+
+    log.info(
+        "Done — %d leads processed | %d enriched | %d emails found",
+        len(leads), enriched, found_emails,
     )
 
 
@@ -224,6 +308,63 @@ def step_mockup(dry_run: bool = False, pre_outreach: bool = False) -> None:
             )
 
     log.info("Done — %d mockups generated.", generated)
+
+
+def step_postcard(dry_run: bool = None) -> None:
+    """
+    Send physical postcards via Lob.com to mockup_ready leads that have a mailing
+    address and a deployed mockup URL but haven't been mailed yet.
+    """
+    from src.config import LOB_LIVE_MODE
+    if dry_run is None:
+        dry_run = not LOB_LIVE_MODE
+
+    log.info("═══ STEP 3b: POSTCARD OUTREACH (dry_run=%s) ═══", dry_run)
+
+    from datetime import datetime as _dt
+    from src.outreach.postcard import send_postcard_batch
+    from src.crm.database import get_conn
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT l.*, m.netlify_url AS mockup_url
+               FROM leads l
+               JOIN mockups m ON m.lead_id = l.id
+               WHERE l.status = 'mockup_ready'
+                 AND l.postcard_id IS NULL
+                 AND l.address_line1 IS NOT NULL
+                 AND l.address_line1 != ''
+                 AND m.netlify_url IS NOT NULL
+               ORDER BY l.score DESC
+               LIMIT 50"""
+        ).fetchall()
+
+    leads = [dict(r) for r in rows]
+    log.info("Found %d leads ready for postcard outreach", len(leads))
+
+    if not leads:
+        log.info("No postcard-eligible leads — skipping.")
+        return
+
+    def _get_mockup_url(lead: dict) -> str:
+        return lead["mockup_url"]
+
+    results = send_postcard_batch(leads, _get_mockup_url, dry_run=dry_run)
+
+    # Stamp postcard_id and postcard_sent_at on each mailed lead
+    if not dry_run:
+        now = _dt.utcnow().isoformat()
+        for lead, postcard_id in zip(leads, results["ids"]):
+            with get_conn() as conn:
+                conn.execute(
+                    "UPDATE leads SET postcard_id=?, postcard_sent_at=?, status='contacted', updated_at=? WHERE id=?",
+                    (postcard_id, now, now, lead["id"]),
+                )
+
+    log.info(
+        "Done — sent=%d | failed=%d | dry_run=%s",
+        results["sent"], results["failed"], results["dry_run"],
+    )
 
 
 def step_close(dry_run: bool = False) -> None:
@@ -514,7 +655,7 @@ def run_top_of_funnel(dry_run: bool = False, yelp_key: str = None, google_key: s
     1. Prospect new leads
     2. Score them
     2b. Generate pre-outreach mockups (for scored leads meeting threshold)
-        → URLs get embedded automatically in the first cold email
+    3b. Mail physical postcards via Lob.com (QR code → mockup URL)
     3. Send cold emails (mockup URL is the hook)
     4. Process follow-up sequence
     5. Generate dossiers for booked calls
@@ -523,7 +664,9 @@ def run_top_of_funnel(dry_run: bool = False, yelp_key: str = None, google_key: s
     init_db()
     step_prospect(yelp_key=yelp_key, google_key=google_key)
     step_score()
+    step_enrich(dry_run=dry_run)                       # find emails for no-website leads via Facebook
     step_mockup(dry_run=dry_run, pre_outreach=True)   # generate BEFORE sending email
+    step_postcard(dry_run=dry_run)                     # mail physical postcards with QR code
     step_outreach(dry_run=dry_run)
     step_followup(dry_run=dry_run)
     step_dossiers()
@@ -545,7 +688,7 @@ def main() -> None:
     parser.add_argument(
         "--step",
         choices=[
-            "prospect", "score", "outreach", "followup",
+            "prospect", "score", "enrich", "outreach", "postcard", "followup",
             "dossiers", "mockup", "close",
             "build", "approve-build", "domain", "vps-provision", "deploy", "handoff", "golive",
             "reviews", "referrals",
@@ -611,6 +754,8 @@ def main() -> None:
             step_prospect(yelp_key=args.yelp_key, google_key=args.google_key)
         case "score":
             step_score()
+        case "enrich":
+            step_enrich(dry_run=args.dry_run)
         case "outreach":
             step_outreach(dry_run=args.dry_run)
         case "followup":
@@ -623,6 +768,8 @@ def main() -> None:
                 step_dossiers()
         case "mockup":
             step_mockup(dry_run=args.dry_run)
+        case "postcard":
+            step_postcard(dry_run=args.dry_run)
         case "close":
             step_close(dry_run=args.dry_run)
         case "build":
