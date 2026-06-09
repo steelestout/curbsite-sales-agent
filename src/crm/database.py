@@ -189,6 +189,8 @@ CREATE INDEX IF NOT EXISTS idx_pagespeed_url     ON pagespeed_cache(url);
 # Indexes that depend on columns added via migration (can't be in SCHEMA executescript).
 _POST_MIGRATION_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_leads_golive ON leads(golive_at)",
+    # Dedup guarantee: silently reject re-scraped businesses across daily runs
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_unique_business ON leads(lower(business_name), lower(city), lower(state))",
 ]
 
 
@@ -278,14 +280,14 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
 def upsert_lead(data: dict) -> int:
     """
-    Insert or update a lead by (business_name, city).
+    Insert or update a lead by (business_name, city, state) — case-insensitive.
     Returns the lead id.
     """
     now = datetime.utcnow().isoformat()
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT id FROM leads WHERE business_name=? AND city=?",
-            (data.get("business_name"), data.get("city")),
+            "SELECT id FROM leads WHERE lower(business_name)=lower(?) AND lower(city)=lower(?) AND lower(state)=lower(?)",
+            (data.get("business_name"), data.get("city"), data.get("state", "")),
         ).fetchone()
 
         if existing:
