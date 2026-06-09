@@ -27,6 +27,7 @@ from src.config import (
     PROSPECTING_DELAY,
 )
 from src.crm.database import upsert_lead
+from src.prospecting.chains import is_chain
 from src.prospecting.locations import get_next_cities, mark_city_scraped
 
 log = logging.getLogger(__name__)
@@ -361,6 +362,11 @@ def prospect(
                 leads = search_overpass(niche, city, state or "IN")
 
             for lead in leads:
+                name = lead.get("business_name", "")
+                if is_chain(name):
+                    log.info("Skipping chain/franchise: %s", name)
+                    continue
+
                 if not lead.get("website") or "yelp.com" in (lead.get("website") or ""):
                     found = detect_website(lead["business_name"], lead.get("city", city))
                     if found:

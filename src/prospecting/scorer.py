@@ -23,6 +23,7 @@ from typing import Optional
 from src.config import SCORE_VOICE_THRESHOLD
 from src.crm.database import get_leads, upsert_lead
 from src.ai_client import score_prompt
+from src.prospecting.chains import is_chain
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +112,17 @@ def score_lead(lead: dict, use_ai: bool = True) -> int:
     """
     Score a single lead, update DB, return final score.
     """
+    if is_chain(lead.get("business_name", "")):
+        upsert_lead({
+            "business_name": lead["business_name"],
+            "city": lead.get("city", ""),
+            "score": 0,
+            "score_reasons": json.dumps(["chain/franchise — disqualified"]),
+            "status": "disqualified",
+        })
+        log.info("Disqualified chain/franchise: %s", lead.get("business_name"))
+        return 0
+
     base, reasons = _base_score(lead)
 
     ai_bonus = 0
